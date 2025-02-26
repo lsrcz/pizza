@@ -177,6 +177,8 @@ module Grisette.Internal.SymPrim.Prim.Internal.Term
     pattern NotTerm,
     pattern OrTerm,
     pattern AndTerm,
+    pattern OrTermAll,
+    pattern AndTermAll,
     pattern EqTerm,
     pattern DistinctTerm,
     pattern ITETerm,
@@ -243,6 +245,42 @@ module Grisette.Internal.SymPrim.Prim.Internal.Term
     parseSMTModelResultError,
     partitionCVArg,
     parseScalarSMTModelResult,
+    bvIsNonZeroFromGEq1,
+
+    -- * Partial evaluation
+    PartialFun,
+    PartialRuleUnary,
+    TotalRuleUnary,
+    PartialRuleBinary,
+    TotalRuleBinary,
+    totalize,
+    totalize2,
+    UnaryPartialStrategy (..),
+    unaryPartial,
+    BinaryCommPartialStrategy (..),
+    BinaryPartialStrategy (..),
+    binaryPartial,
+
+    -- * Unfold
+    unaryUnfoldOnce,
+    binaryUnfoldOnce,
+    generalUnaryUnfolded,
+    generalBinaryUnfolded,
+
+    -- * bv
+    unsafePevalBVConcatTerm,
+    unsafePevalBVExtendTerm,
+    unsafePevalBVSelectTerm,
+    boolToBVTerm,
+
+    -- * num
+    pevalDefaultAddNumTerm,
+    pevalDefaultNegNumTerm,
+    pevalDefaultMulNumTerm,
+    pevalBitsAbsNumTerm,
+    doPevalNoOverflowAbsNumTerm,
+    pevalGeneralSignumNumTerm,
+    doPevalNoOverflowSignumNumTerm,
   )
 where
 
@@ -280,6 +318,7 @@ import Language.Haskell.TH (TExpQ)
 
 import Control.DeepSeq (NFData (rnf))
 import Control.Monad (msum)
+import Control.Monad.Except (MonadError (catchError))
 import Control.Monad.IO.Class (MonadIO)
 import qualified Control.Monad.RWS.Lazy as Lazy
 import qualified Control.Monad.RWS.Strict as Strict
@@ -290,34 +329,60 @@ import qualified Control.Monad.Writer.Lazy as Lazy
 import qualified Control.Monad.Writer.Strict as Strict
 import Data.Atomics (atomicModifyIORefCAS_)
 import qualified Data.Binary as Binary
-import Data.Bits (Bits)
+import Data.Bits
+  ( Bits (complement, isSigned, xor, zeroBits, (.&.), (.|.)),
+    FiniteBits (countLeadingZeros),
+  )
 import Data.Bytes.Serial (Serial (deserialize, serialize))
+import Data.Coerce (coerce)
 import qualified Data.HashMap.Strict as HM
+import qualified Data.HashSet as HS
 import Data.Hashable (Hashable (hashWithSalt))
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Kind (Constraint, Type)
 import Data.List.NonEmpty (NonEmpty ((:|)), toList)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
+import Data.Proxy (Proxy (Proxy))
+import Data.SBV (BVIsNonZero)
 import qualified Data.SBV as SBV
 import qualified Data.SBV.Dynamic as SBVD
 import qualified Data.SBV.Trans as SBVT
 import qualified Data.SBV.Trans.Control as SBVTC
 import qualified Data.Serialize as Cereal
 import Data.String (IsString (fromString))
-import Data.Typeable (Proxy (Proxy), cast, typeRepFingerprint)
+import Data.Type.Equality ((:~:) (Refl), type (:~~:) (HRefl))
+import Data.Typeable (Typeable, cast, typeRepFingerprint)
 import GHC.Exts (Any, sortWith)
 import GHC.Fingerprint (Fingerprint)
 import GHC.Generics (Generic)
 import GHC.IO (unsafePerformIO)
 import GHC.Stack (HasCallStack)
-import GHC.TypeNats (KnownNat, Nat, type (+), type (<=))
-import Grisette.Internal.Core.Data.Class.BitCast (BitCast, BitCastOr)
-import Grisette.Internal.Core.Data.Class.BitVector (SizedBV)
+import GHC.TypeNats (KnownNat, Nat, natVal, sameNat, type (+), type (-), type (<=))
+import Grisette.Internal.Core.Data.Class.BitCast (BitCast (bitCast), BitCastOr)
+import Grisette.Internal.Core.Data.Class.BitVector
+  ( SizedBV
+      ( sizedBVConcat,
+        sizedBVFromIntegral,
+        sizedBVSelect,
+        sizedBVSext,
+        sizedBVZext
+      ),
+  )
+import Grisette.Internal.Core.Data.Class.IEEEFP
+  ( fpIsNegativeZero,
+    fpIsPositiveZero,
+  )
 import Grisette.Internal.Core.Data.Symbol
   ( Identifier,
     Symbol (IndexedSymbol, SimpleSymbol),
   )
-import Grisette.Internal.SymPrim.FP (FP, FPRoundingMode, ValidFP)
+import Grisette.Internal.SymPrim.AlgReal (AlgReal, fromSBVAlgReal, toSBVAlgReal)
+import Grisette.Internal.SymPrim.BV (IntN, WordN)
+import Grisette.Internal.SymPrim.FP
+  ( FP (FP),
+    FPRoundingMode (RNA, RNE, RTN, RTP, RTZ),
+    ValidFP,
+  )
 import Grisette.Internal.SymPrim.Prim.Internal.Caches
   ( CachedInfo
       ( CachedInfo,
@@ -343,16 +408,30 @@ import Grisette.Internal.SymPrim.Prim.Internal.Utils
   ( WeakThreadId,
     myWeakThreadId,
   )
+import Grisette.Internal.Utils.Parameterized
+  ( LeqProof (LeqProof),
+    NatRepr,
+    SomeNatRepr (SomeNatRepr),
+    SomePositiveNatRepr (SomePositiveNatRepr),
+    addNat,
+    mkNatRepr,
+    mkPositiveNatRepr,
+    natRepr,
+    unsafeAxiom,
+    unsafeKnownProof,
+    unsafeLeqProof,
+    withKnownNat,
+    withKnownProof,
+  )
 import Language.Haskell.TH.Syntax (Lift (liftTyped))
 import Type.Reflection
   ( SomeTypeRep (SomeTypeRep),
     TypeRep,
-    Typeable,
     eqTypeRep,
     someTypeRep,
     typeRep,
-    type (:~~:) (HRefl),
   )
+import qualified Type.Reflection as R
 import Unsafe.Coerce (unsafeCoerce)
 
 -- $setup
@@ -801,7 +880,15 @@ class
   sbvBitCastOr :: SBVType b -> SBVType a -> SBVType b
 
 -- | Partial evaluation and lowering for bit-vector terms.
-class (SizedBV bv) => PEvalBVTerm bv where
+class
+  ( SizedBV bv,
+    forall n. (KnownNat n, 1 <= n) => PEvalNumTerm (bv n),
+    forall n. (KnownNat n, 1 <= n) => PEvalBitwiseTerm (bv n),
+    forall n. (KnownNat n, 1 <= n) => FiniteBits (bv n),
+    forall n. (KnownNat n, 1 <= n) => Num (bv n)
+  ) =>
+  PEvalBVTerm bv
+  where
   pevalBVConcatTerm ::
     (KnownNat l, KnownNat r, 1 <= l, 1 <= r) =>
     Term (bv l) ->
@@ -1362,11 +1449,13 @@ data Term t where
     {-# UNPACK #-} !CachedInfo ->
     !(Term Bool) ->
     !(Term Bool) ->
+    !(HS.HashSet (Term Bool)) -> -- All or'ed terms
     Term Bool
   AndTerm' ::
     {-# UNPACK #-} !CachedInfo ->
     !(Term Bool) ->
     !(Term Bool) ->
+    !(HS.HashSet (Term Bool)) -> -- All and'ed terms
     Term Bool
   EqTerm' ::
     {-# UNPACK #-} !CachedInfo ->
@@ -1661,7 +1750,13 @@ pattern SupportedTerm <-
 
 #if MIN_VERSION_base(4, 16, 4)
 {-# COMPLETE SupportedTerm #-}
+{-# INLINE SupportedTerm #-}
 #endif
+
+-- | Cast a term to another type.
+castTerm :: forall a b. (Typeable b) => Term a -> Maybe (Term b)
+castTerm t@SupportedTerm = cast t
+{-# INLINE castTerm #-}
 
 data SupportedTypedSymbolEvidence (k :: SymbolKind) t where
   SupportedTypedSymbolEvidence ::
@@ -1684,6 +1779,7 @@ pattern SupportedTypedSymbol <-
 
 #if MIN_VERSION_base(4, 16, 4)
 {-# COMPLETE SupportedTypedSymbol #-}
+{-# INLINE SupportedTypedSymbol #-}
 #endif
 
 data SupportedConstantTypedSymbolEvidence k t where
@@ -1721,12 +1817,20 @@ pattern SupportedConstantTypedSymbol <-
       Just SupportedConstantTypedSymbolEvidence
     )
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE SupportedConstantTypedSymbol #-}
+#endif
+
 -- | Pattern synonym for 'ConTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
 pattern ConTerm :: forall t. () => (SupportedPrim t) => t -> Term t
 pattern ConTerm t <- (ConTerm' _ t)
   where
     ConTerm = conTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ConTerm #-}
+#endif
 
 -- | Pattern synonym for 'SymTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
@@ -1735,6 +1839,10 @@ pattern SymTerm ::
 pattern SymTerm t <- (SymTerm' _ t@SupportedTypedSymbol)
   where
     SymTerm = symTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE SymTerm #-}
+#endif
 
 -- | Pattern synonym for 'ForallTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -1751,6 +1859,10 @@ pattern ForallTerm sym body <-
   where
     ForallTerm = forallTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ForallTerm #-}
+#endif
+
 -- | Pattern synonym for 'ExistsTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern ExistsTerm ::
@@ -1766,6 +1878,10 @@ pattern ExistsTerm sym body <-
   where
     ExistsTerm = existsTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ExistsTerm #-}
+#endif
+
 -- | Pattern synonym for 'NotTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
 pattern NotTerm :: forall r. () => (r ~ Bool) => Term Bool -> Term r
@@ -1773,19 +1889,57 @@ pattern NotTerm body <- (NotTerm' _ body)
   where
     NotTerm = pevalNotTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE NotTerm #-}
+#endif
+
 -- | Pattern synonym for 'OrTerm''. Note that using this pattern to construct a
 -- 'Term' will do term simplification.
 pattern OrTerm :: forall r. () => (r ~ Bool) => Term Bool -> Term Bool -> Term r
-pattern OrTerm l r <- (OrTerm' _ l r)
+pattern OrTerm l r <- (OrTerm' _ l r _)
   where
     OrTerm = pevalOrTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE OrTerm #-}
+#endif
+
+-- | Pattern synonym for 'OrTerm''. Note that using this pattern to construct a
+-- 'Term' will do term simplification.
+pattern OrTermAll ::
+  forall r.
+  () =>
+  (r ~ Bool) =>
+  Term Bool -> Term Bool -> HS.HashSet (Term Bool) -> Term r
+pattern OrTermAll l r s <- (OrTerm' _ l r s)
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE OrTermAll #-}
+#endif
 
 -- | Pattern synonym for 'AndTerm''. Note that using this pattern to construct a
 -- 'Term' will do term simplification.
 pattern AndTerm :: forall r. () => (r ~ Bool) => Term Bool -> Term Bool -> Term r
-pattern AndTerm l r <- (AndTerm' _ l r)
+pattern AndTerm l r <- (AndTerm' _ l r _)
   where
     AndTerm = pevalAndTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE AndTerm #-}
+#endif
+
+-- | Pattern synonym for 'AndTerm''. Note that using this pattern to construct a
+-- 'Term' will do term simplification.
+pattern AndTermAll ::
+  forall r.
+  () =>
+  (r ~ Bool) =>
+  Term Bool -> Term Bool -> HS.HashSet (Term Bool) -> Term r
+pattern AndTermAll l r s <- (AndTerm' _ l r s)
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE AndTermAll #-}
+#endif
 
 -- | Pattern synonym for 'EqTerm''. Note that using this pattern to construct a
 -- 'Term' will do term simplification.
@@ -1801,6 +1955,10 @@ pattern EqTerm l r <- (EqTerm' _ l r@SupportedTerm)
   where
     EqTerm = pevalEqTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE EqTerm #-}
+#endif
+
 -- | Pattern synonym for 'DistinctTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern DistinctTerm ::
@@ -1813,6 +1971,10 @@ pattern DistinctTerm ::
 pattern DistinctTerm ts <- (DistinctTerm' _ ts@(SupportedTerm :| _))
   where
     DistinctTerm = pevalDistinctTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE DistinctTerm #-}
+#endif
 
 -- | Pattern synonym for 'ITETerm''. Note that using this pattern to construct a
 -- 'Term' will do term simplification.
@@ -1828,6 +1990,10 @@ pattern ITETerm cond t1 t2 <- (ITETerm' _ cond t1 t2)
   where
     ITETerm = pevalITETerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ITETerm #-}
+#endif
+
 -- | Pattern synonym for 'AddNumTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern AddNumTerm ::
@@ -1841,6 +2007,10 @@ pattern AddNumTerm l r <- (AddNumTerm' _ l r)
   where
     AddNumTerm = pevalAddNumTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE AddNumTerm #-}
+#endif
+
 -- | Pattern synonym for 'NegNumTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern NegNumTerm ::
@@ -1852,6 +2022,10 @@ pattern NegNumTerm ::
 pattern NegNumTerm t <- (NegNumTerm' _ t)
   where
     NegNumTerm = pevalNegNumTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE NegNumTerm #-}
+#endif
 
 -- | Pattern synonym for 'MulNumTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -1866,6 +2040,10 @@ pattern MulNumTerm l r <- (MulNumTerm' _ l r)
   where
     MulNumTerm = pevalMulNumTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE MulNumTerm #-}
+#endif
+
 -- | Pattern synonym for 'AbsNumTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern AbsNumTerm ::
@@ -1878,6 +2056,10 @@ pattern AbsNumTerm t <- (AbsNumTerm' _ t)
   where
     AbsNumTerm = pevalAbsNumTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE AbsNumTerm #-}
+#endif
+
 -- | Pattern synonym for 'SignumNumTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern SignumNumTerm ::
@@ -1889,6 +2071,10 @@ pattern SignumNumTerm ::
 pattern SignumNumTerm t <- (SignumNumTerm' _ t)
   where
     SignumNumTerm = pevalSignumNumTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE SignumNumTerm #-}
+#endif
 
 -- | Pattern synonym for 'LtOrdTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
@@ -1904,6 +2090,10 @@ pattern LtOrdTerm l r <- (LtOrdTerm' _ l r@SupportedTerm)
   where
     LtOrdTerm = pevalLtOrdTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE LtOrdTerm #-}
+#endif
+
 -- | Pattern synonym for 'LeOrdTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
 pattern LeOrdTerm ::
@@ -1918,6 +2108,10 @@ pattern LeOrdTerm l r <- (LeOrdTerm' _ l r@SupportedTerm)
   where
     LeOrdTerm = pevalLeOrdTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE LeOrdTerm #-}
+#endif
+
 -- | Pattern synonym for 'AndBitsTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern AndBitsTerm ::
@@ -1930,6 +2124,10 @@ pattern AndBitsTerm ::
 pattern AndBitsTerm l r <- (AndBitsTerm' _ l r)
   where
     AndBitsTerm = pevalAndBitsTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE AndBitsTerm #-}
+#endif
 
 -- | Pattern synonym for 'OrBitsTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -1944,6 +2142,10 @@ pattern OrBitsTerm l r <- (OrBitsTerm' _ l r)
   where
     OrBitsTerm = pevalOrBitsTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE OrBitsTerm #-}
+#endif
+
 -- | Pattern synonym for 'XorBitsTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern XorBitsTerm ::
@@ -1957,6 +2159,10 @@ pattern XorBitsTerm l r <- (XorBitsTerm' _ l r)
   where
     XorBitsTerm = pevalXorBitsTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE XorBitsTerm #-}
+#endif
+
 -- | Pattern synonym for 'ComplementBitsTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern ComplementBitsTerm ::
@@ -1968,6 +2174,10 @@ pattern ComplementBitsTerm ::
 pattern ComplementBitsTerm t <- (ComplementBitsTerm' _ t)
   where
     ComplementBitsTerm = pevalComplementBitsTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ComplementBitsTerm #-}
+#endif
 
 -- | Pattern synonym for 'ShiftLeftTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -1982,6 +2192,10 @@ pattern ShiftLeftTerm l r <- (ShiftLeftTerm' _ l r)
   where
     ShiftLeftTerm = pevalShiftLeftTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ShiftLeftTerm #-}
+#endif
+
 -- | Pattern synonym for 'ShiftRightTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern ShiftRightTerm ::
@@ -1994,6 +2208,10 @@ pattern ShiftRightTerm ::
 pattern ShiftRightTerm l r <- (ShiftRightTerm' _ l r)
   where
     ShiftRightTerm = pevalShiftRightTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ShiftRightTerm #-}
+#endif
 
 -- | Pattern synonym for 'RotateLeftTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -2008,6 +2226,10 @@ pattern RotateLeftTerm l r <- (RotateLeftTerm' _ l r)
   where
     RotateLeftTerm = pevalRotateLeftTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE RotateLeftTerm #-}
+#endif
+
 -- | Pattern synonym for 'RotateRightTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern RotateRightTerm ::
@@ -2020,6 +2242,10 @@ pattern RotateRightTerm ::
 pattern RotateRightTerm l r <- (RotateRightTerm' _ l r)
   where
     RotateRightTerm = pevalRotateRightTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE RotateRightTerm #-}
+#endif
 
 -- | Pattern synonym for 'BitCastTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -2034,6 +2260,10 @@ pattern BitCastTerm t <- (BitCastTerm' _ t@SupportedTerm)
   where
     BitCastTerm = pevalBitCastTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE BitCastTerm #-}
+#endif
+
 -- | Pattern synonym for 'BitCastOrTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern BitCastOrTerm ::
@@ -2047,6 +2277,10 @@ pattern BitCastOrTerm ::
 pattern BitCastOrTerm t1 t2 <- (BitCastOrTerm' _ t1 t2@SupportedTerm)
   where
     BitCastOrTerm = pevalBitCastOrTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE BitCastOrTerm #-}
+#endif
 
 -- | Pattern synonym for 'BVConcatTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -2073,6 +2307,10 @@ pattern BVConcatTerm l r <- (BVConcatTerm' _ l@SupportedTerm r@SupportedTerm)
   where
     BVConcatTerm = pevalBVConcatTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE BVConcatTerm #-}
+#endif
+
 -- | Pattern synonym for 'BVSelectTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern BVSelectTerm ::
@@ -2098,6 +2336,10 @@ pattern BVSelectTerm ix w t <- (BVSelectTerm' _ ix w t@SupportedTerm)
   where
     BVSelectTerm = pevalBVSelectTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE BVSelectTerm #-}
+#endif
+
 -- | Pattern synonym for 'BVExtendTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern BVExtendTerm ::
@@ -2122,6 +2364,10 @@ pattern BVExtendTerm signed p t <- (BVExtendTerm' _ signed p t@SupportedTerm)
   where
     BVExtendTerm = pevalBVExtendTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE BVExtendTerm #-}
+#endif
+
 -- | Pattern synonym for 'ApplyTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
 pattern ApplyTerm ::
@@ -2136,6 +2382,10 @@ pattern ApplyTerm f x <- (ApplyTerm' _ f@SupportedTerm x@SupportedTerm)
   where
     ApplyTerm = pevalApplyTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ApplyTerm #-}
+#endif
+
 -- | Pattern synonym for 'DivIntegralTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern DivIntegralTerm ::
@@ -2148,6 +2398,10 @@ pattern DivIntegralTerm ::
 pattern DivIntegralTerm l r <- (DivIntegralTerm' _ l r)
   where
     DivIntegralTerm = pevalDivIntegralTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE DivIntegralTerm #-}
+#endif
 
 -- | Pattern synonym for 'ModIntegralTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -2162,6 +2416,10 @@ pattern ModIntegralTerm l r <- (ModIntegralTerm' _ l r)
   where
     ModIntegralTerm = pevalModIntegralTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ModIntegralTerm #-}
+#endif
+
 -- | Pattern synonym for 'QuotIntegralTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern QuotIntegralTerm ::
@@ -2175,6 +2433,10 @@ pattern QuotIntegralTerm l r <- (QuotIntegralTerm' _ l r)
   where
     QuotIntegralTerm = pevalQuotIntegralTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE QuotIntegralTerm #-}
+#endif
+
 -- | Pattern synonym for 'RemIntegralTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern RemIntegralTerm ::
@@ -2187,6 +2449,10 @@ pattern RemIntegralTerm ::
 pattern RemIntegralTerm l r <- (RemIntegralTerm' _ l r)
   where
     RemIntegralTerm = pevalRemIntegralTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE RemIntegralTerm #-}
+#endif
 
 -- | Pattern synonym for 'FPTraitTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -2202,6 +2468,10 @@ pattern FPTraitTerm trait t <- (FPTraitTerm' _ trait t)
   where
     FPTraitTerm = pevalFPTraitTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FPTraitTerm #-}
+#endif
+
 -- | Pattern synonym for 'FdivTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
 pattern FdivTerm ::
@@ -2215,6 +2485,10 @@ pattern FdivTerm l r <- (FdivTerm' _ l r)
   where
     FdivTerm = pevalFdivTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FdivTerm #-}
+#endif
+
 -- | Pattern synonym for 'RecipTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
 pattern RecipTerm ::
@@ -2226,6 +2500,10 @@ pattern RecipTerm ::
 pattern RecipTerm t <- (RecipTerm' _ t)
   where
     RecipTerm = pevalRecipTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE RecipTerm #-}
+#endif
 
 -- | Pattern synonym for 'FloatingUnaryTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -2240,6 +2518,10 @@ pattern FloatingUnaryTerm op t <- (FloatingUnaryTerm' _ op t)
   where
     FloatingUnaryTerm = pevalFloatingUnaryTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FloatingUnaryTerm #-}
+#endif
+
 -- | Pattern synonym for 'PowerTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
 pattern PowerTerm ::
@@ -2252,6 +2534,10 @@ pattern PowerTerm ::
 pattern PowerTerm l r <- (PowerTerm' _ l r)
   where
     PowerTerm = pevalPowerTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE PowerTerm #-}
+#endif
 
 -- | Pattern synonym for 'FPUnaryTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
@@ -2266,6 +2552,10 @@ pattern FPUnaryTerm ::
 pattern FPUnaryTerm op t <- (FPUnaryTerm' _ op t)
   where
     FPUnaryTerm = pevalFPUnaryTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FPUnaryTerm #-}
+#endif
 
 -- | Pattern synonym for 'FPBinaryTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
@@ -2282,6 +2572,10 @@ pattern FPBinaryTerm op l r <- (FPBinaryTerm' _ op l r)
   where
     FPBinaryTerm = pevalFPBinaryTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FPBinaryTerm #-}
+#endif
+
 -- | Pattern synonym for 'FPRoundingUnaryTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern FPRoundingUnaryTerm ::
@@ -2296,6 +2590,10 @@ pattern FPRoundingUnaryTerm ::
 pattern FPRoundingUnaryTerm op rm t <- (FPRoundingUnaryTerm' _ op rm t)
   where
     FPRoundingUnaryTerm = pevalFPRoundingUnaryTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FPRoundingUnaryTerm #-}
+#endif
 
 -- | Pattern synonym for 'FPRoundingBinaryTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
@@ -2313,6 +2611,10 @@ pattern FPRoundingBinaryTerm op rm l r <- (FPRoundingBinaryTerm' _ op rm l r)
   where
     FPRoundingBinaryTerm = pevalFPRoundingBinaryTerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FPRoundingBinaryTerm #-}
+#endif
+
 -- | Pattern synonym for 'FPFMATerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
 pattern FPFMATerm ::
@@ -2329,6 +2631,10 @@ pattern FPFMATerm rm t1 t2 t3 <- (FPFMATerm' _ rm t1 t2 t3)
   where
     FPFMATerm = pevalFPFMATerm
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FPFMATerm #-}
+#endif
+
 -- | Pattern synonym for 'FromIntegralTerm''. Note that using this pattern to
 -- construct a 'Term' will do term simplification.
 pattern FromIntegralTerm ::
@@ -2341,6 +2647,10 @@ pattern FromIntegralTerm ::
 pattern FromIntegralTerm t <- (FromIntegralTerm' _ t@SupportedTerm)
   where
     FromIntegralTerm = pevalFromIntegralTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FromIntegralTerm #-}
+#endif
 
 -- | Pattern synonym for 'FromFPOrTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
@@ -2359,6 +2669,10 @@ pattern FromFPOrTerm ::
 pattern FromFPOrTerm t1 rm t2 <- (FromFPOrTerm' _ t1 rm t2)
   where
     FromFPOrTerm = pevalFromFPOrTerm
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FromFPOrTerm #-}
+#endif
 
 -- | Pattern synonym for 'ToFPTerm''. Note that using this pattern to construct
 -- a 'Term' will do term simplification.
@@ -2380,6 +2694,10 @@ pattern ToFPTerm ::
 pattern ToFPTerm rm t eb sb <- (ToFPTerm' _ rm t@SupportedTerm eb sb)
   where
     ToFPTerm rm t _ _ = pevalToFPTerm rm t
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE ToFPTerm #-}
+#endif
 
 #if MIN_VERSION_base(4, 16, 4)
 {-# COMPLETE
@@ -2441,8 +2759,8 @@ termInfo (SymTerm' i _) = i
 termInfo (ForallTerm' i _ _) = i
 termInfo (ExistsTerm' i _ _) = i
 termInfo (NotTerm' i _) = i
-termInfo (OrTerm' i _ _) = i
-termInfo (AndTerm' i _ _) = i
+termInfo (OrTerm' i _ _ _) = i
+termInfo (AndTerm' i _ _ _) = i
 termInfo (EqTerm' i _ _) = i
 termInfo (DistinctTerm' i _) = i
 termInfo (ITETerm' i _ _ _) = i
@@ -2508,6 +2826,10 @@ termStableIdent = cachedStableIdent . termInfo
 -- | Pattern for term with dynamic typing.
 pattern DynTerm :: forall a b. (SupportedPrim a) => Term a -> Term b
 pattern DynTerm x <- ((\v@SupportedTerm -> cast v) -> Just x)
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE DynTerm #-}
+#endif
 
 -- baseHash :: Term t -> Digest
 -- baseHash t = case hashId t of
@@ -2994,15 +3316,15 @@ instance Show (Term ty) where
       ++ ", arg2="
       ++ show arg2
       ++ "}"
-  show t@(BVSelectTerm arg ix w) =
+  show t@(BVSelectTerm ix w arg) =
     "BVSelect{tid="
       ++ show (termThreadId t)
       ++ ", id="
       ++ show (termId t)
       ++ ", ix="
-      ++ show ix
+      ++ show (natVal ix)
       ++ ", w="
-      ++ show w
+      ++ show (natVal w)
       ++ ", arg="
       ++ show arg
       ++ "}"
@@ -3014,7 +3336,7 @@ instance Show (Term ty) where
       ++ ", signed="
       ++ show signed
       ++ ", n="
-      ++ show n
+      ++ show (natVal n)
       ++ ", arg="
       ++ show arg
       ++ "}"
@@ -3254,8 +3576,8 @@ data UTerm t where
     !(Term Bool) ->
     UTerm Bool
   UNotTerm :: !(Term Bool) -> UTerm Bool
-  UOrTerm :: !(Term Bool) -> !(Term Bool) -> UTerm Bool
-  UAndTerm :: !(Term Bool) -> !(Term Bool) -> UTerm Bool
+  UOrTerm :: !(Term Bool) -> !(Term Bool) -> !(HS.HashSet (Term Bool)) -> UTerm Bool
+  UAndTerm :: !(Term Bool) -> !(Term Bool) -> !(HS.HashSet (Term Bool)) -> UTerm Bool
   UEqTerm :: !(Term t) -> !(Term t) -> UTerm Bool
   UDistinctTerm :: !(NonEmpty (Term t)) -> UTerm Bool
   UITETerm ::
@@ -3722,11 +4044,13 @@ instance Interned (Term t) where
       {-# UNPACK #-} !Digest ->
       {-# UNPACK #-} !HashId ->
       {-# UNPACK #-} !HashId ->
+      !(HS.HashSet (Term Bool)) ->
       Description (Term Bool)
     DAndTerm ::
       {-# UNPACK #-} !Digest ->
       {-# UNPACK #-} !HashId ->
       {-# UNPACK #-} !HashId ->
+      !(HS.HashSet (Term Bool)) ->
       Description (Term Bool)
     DEqTerm ::
       {-# UNPACK #-} !Digest ->
@@ -3954,20 +4278,22 @@ instance Interned (Term t) where
   describe (UNotTerm arg) =
     let argHashId = termHashId arg
      in DNotTerm (preHashNotDescription argHashId) argHashId
-  describe (UOrTerm arg1 arg2) =
+  describe (UOrTerm arg1 arg2 s) =
     let arg1HashId = termHashId arg1
         arg2HashId = termHashId arg2
      in DOrTerm
           (preHashOrDescription arg1HashId arg2HashId)
           arg1HashId
           arg2HashId
-  describe (UAndTerm arg1 arg2) =
+          s
+  describe (UAndTerm arg1 arg2 s) =
     let arg1HashId = termHashId arg1
         arg2HashId = termHashId arg2
      in DAndTerm
           (preHashAndDescription arg1HashId arg2HashId)
           arg1HashId
           arg2HashId
+          s
   describe (UEqTerm (arg1@SupportedTerm :: Term arg) arg2) = do
     let fingerprint = typeFingerprint @arg
         arg1HashId = termHashId arg1
@@ -4260,8 +4586,8 @@ instance Interned (Term t) where
       go (UForallTerm sym arg) = ForallTerm' info sym arg
       go (UExistsTerm sym arg) = ExistsTerm' info sym arg
       go (UNotTerm arg) = NotTerm' info arg
-      go (UOrTerm arg1 arg2) = OrTerm' info arg1 arg2
-      go (UAndTerm arg1 arg2) = AndTerm' info arg1 arg2
+      go (UOrTerm arg1 arg2 s) = OrTerm' info arg1 arg2 s
+      go (UAndTerm arg1 arg2 s) = AndTerm' info arg1 arg2 s
       go (UEqTerm arg1 arg2) = EqTerm' info arg1 arg2
       go (UDistinctTerm args) = DistinctTerm' info args
       -- ITE is propagated
@@ -4325,8 +4651,8 @@ instance Interned (Term t) where
   descriptionDigest (DForallTerm h _ _) = h
   descriptionDigest (DExistsTerm h _ _) = h
   descriptionDigest (DNotTerm h _) = h
-  descriptionDigest (DOrTerm h _ _) = h
-  descriptionDigest (DAndTerm h _ _) = h
+  descriptionDigest (DOrTerm h _ _ _) = h
+  descriptionDigest (DAndTerm h _ _ _) = h
   descriptionDigest (DEqTerm h _ _ _) = h
   descriptionDigest (DDistinctTerm h _ _) = h
   descriptionDigest (DITETerm h _ _ _) = h
@@ -4552,8 +4878,8 @@ instance Eq (Description (Term t)) where
   DExistsTerm _ ls li == DExistsTerm _ rs ri =
     eqHeteroSymbol ls rs && eqHashId li ri
   DNotTerm _ li == DNotTerm _ ri = eqHashId li ri
-  DOrTerm _ li1 li2 == DOrTerm _ ri1 ri2 = eqHashId li1 ri1 && eqHashId li2 ri2
-  DAndTerm _ li1 li2 == DAndTerm _ ri1 ri2 = eqHashId li1 ri1 && eqHashId li2 ri2
+  DOrTerm _ li1 li2 _ == DOrTerm _ ri1 ri2 _ = eqHashId li1 ri1 && eqHashId li2 ri2
+  DAndTerm _ li1 li2 _ == DAndTerm _ ri1 ri2 _ = eqHashId li1 ri1 && eqHashId li2 ri2
   DEqTerm _ lfp li1 li2 == DEqTerm _ rfp ri1 ri2 = lfp == rfp && eqHashId li1 ri1 && eqHashId li2 ri2
   DDistinctTerm _ lfp li == DDistinctTerm _ rfp ri =
     lfp == rfp
@@ -4646,6 +4972,20 @@ fullReconstructTerm3 f x y z = do
   f rx ry rz
 {-# INLINE fullReconstructTerm3 #-}
 
+fullReconstructTerm2Set ::
+  forall a c.
+  (Term a -> Term a -> HS.HashSet (Term a) -> IO (Term c)) ->
+  Term a ->
+  Term a ->
+  HS.HashSet (Term a) ->
+  IO (Term c)
+fullReconstructTerm2Set f x y s = do
+  rx@SupportedTerm <- fullReconstructTerm x
+  ry <- fullReconstructTerm y
+  rs <- traverse fullReconstructTerm (HS.toList s)
+  f rx ry (HS.fromList rs)
+{-# INLINE fullReconstructTerm2Set #-}
+
 fullReconstructTerm :: forall t. Term t -> IO (Term t)
 fullReconstructTerm (ConTerm i) = curThreadConTerm i
 fullReconstructTerm (SymTerm sym) = curThreadSymTerm sym
@@ -4655,10 +4995,12 @@ fullReconstructTerm (ExistsTerm sym arg) =
   fullReconstructTerm1 (curThreadExistsTerm sym) arg
 fullReconstructTerm (NotTerm arg) =
   fullReconstructTerm1 curThreadNotTerm arg
-fullReconstructTerm (OrTerm arg1 arg2) =
-  fullReconstructTerm2 curThreadOrTerm arg1 arg2
-fullReconstructTerm (AndTerm arg1 arg2) =
-  fullReconstructTerm2 curThreadAndTerm arg1 arg2
+fullReconstructTerm (OrTermAll arg1 arg2 s) =
+  fullReconstructTerm2Set curThreadOrTerm arg1 arg2 s
+fullReconstructTerm (OrTerm _ _) = error "Make compiler happy"
+fullReconstructTerm (AndTermAll arg1 arg2 s) =
+  fullReconstructTerm2Set curThreadAndTerm arg1 arg2 s
+fullReconstructTerm (AndTerm _ _) = error "Make compiler happy"
 fullReconstructTerm (EqTerm arg1 arg2) =
   fullReconstructTerm2 curThreadEqTerm arg1 arg2
 fullReconstructTerm (DistinctTerm args) =
@@ -4804,13 +5146,13 @@ curThreadNotTerm = intern . UNotTerm
 {-# INLINE curThreadNotTerm #-}
 
 -- | Construct and internalizing a 'OrTerm'.
-curThreadOrTerm :: Term Bool -> Term Bool -> IO (Term Bool)
-curThreadOrTerm l r = intern $ UOrTerm l r
+curThreadOrTerm :: Term Bool -> Term Bool -> HS.HashSet (Term Bool) -> IO (Term Bool)
+curThreadOrTerm l r s = intern $ UOrTerm l r s
 {-# INLINE curThreadOrTerm #-}
 
 -- | Construct and internalizing a 'AndTerm'.
-curThreadAndTerm :: Term Bool -> Term Bool -> IO (Term Bool)
-curThreadAndTerm l r = intern $ UAndTerm l r
+curThreadAndTerm :: Term Bool -> Term Bool -> HS.HashSet (Term Bool) -> IO (Term Bool)
+curThreadAndTerm l r s = intern $ UAndTerm l r s
 {-# INLINE curThreadAndTerm #-}
 
 -- | Construct and internalizing a 'EqTerm'.
@@ -5271,14 +5613,93 @@ notTerm :: Term Bool -> Term Bool
 notTerm = unsafeInCurThread1 curThreadNotTerm
 {-# NOINLINE notTerm #-}
 
+inCurThread2Set ::
+  forall a c.
+  (Term a -> Term a -> HS.HashSet (Term a) -> IO (Term c)) ->
+  Term a ->
+  Term a ->
+  HS.HashSet (Term a) ->
+  IO (Term c)
+inCurThread2Set f a b s = do
+  tid <- myWeakThreadId
+  ra@SupportedTerm <- toCurThreadImpl tid a
+  rb <- toCurThreadImpl tid b
+  rs <- traverse (toCurThreadImpl tid) (HS.toList s)
+  f ra rb (HS.fromList rs)
+{-# INLINE inCurThread2Set #-}
+
+unsafeInCurThread2Set ::
+  forall a c.
+  (Term a -> Term a -> HS.HashSet (Term a) -> IO (Term c)) ->
+  Term a ->
+  Term a ->
+  HS.HashSet (Term a) ->
+  Term c
+unsafeInCurThread2Set f a b s = unsafePerformIO $ inCurThread2Set f a b s
+{-# NOINLINE unsafeInCurThread2Set #-}
+
 -- | Construct and internalizing a 'OrTerm'.
 orTerm :: Term Bool -> Term Bool -> Term Bool
-orTerm = unsafeInCurThread2 curThreadOrTerm
+orTerm l@(OrTermAll _ _ s1) r@(OrTermAll _ _ s2) =
+  unsafeInCurThread2Set
+    curThreadOrTerm
+    l
+    r
+    ( if HS.size s1 + HS.size s2 > 30
+        then HS.fromList [l, r]
+        else HS.insert l $ HS.insert r $ HS.union s1 s2
+    )
+orTerm l@(OrTermAll _ _ s1) r =
+  unsafeInCurThread2Set
+    curThreadOrTerm
+    l
+    r
+    ( if HS.size s1 > 30
+        then HS.fromList [l, r]
+        else HS.insert r $ HS.insert l s1
+    )
+orTerm l r@(OrTermAll _ _ s2) =
+  unsafeInCurThread2Set
+    curThreadOrTerm
+    l
+    r
+    ( if HS.size s2 > 30
+        then HS.fromList [l, r]
+        else HS.insert l $ HS.insert r s2
+    )
+orTerm l r = unsafeInCurThread2Set curThreadOrTerm l r (HS.fromList [l, r])
 {-# NOINLINE orTerm #-}
 
 -- | Construct and internalizing a 'AndTerm'.
 andTerm :: Term Bool -> Term Bool -> Term Bool
-andTerm = unsafeInCurThread2 curThreadAndTerm
+andTerm l@(AndTermAll _ _ s1) r@(AndTermAll _ _ s2) =
+  unsafeInCurThread2Set
+    curThreadAndTerm
+    l
+    r
+    ( if HS.size s1 + HS.size s2 > 30
+        then HS.fromList [l, r]
+        else HS.insert l $ HS.insert r $ HS.union s1 s2
+    )
+andTerm l@(AndTermAll _ _ s1) r =
+  unsafeInCurThread2Set
+    curThreadAndTerm
+    l
+    r
+    ( if HS.size s1 > 30
+        then HS.fromList [l, r]
+        else HS.insert r $ HS.insert l s1
+    )
+andTerm l r@(AndTermAll _ _ s2) =
+  unsafeInCurThread2Set
+    curThreadAndTerm
+    l
+    r
+    ( if HS.size s2 > 30
+        then HS.fromList [l, r]
+        else HS.insert l $ HS.insert r s2
+    )
+andTerm l r = unsafeInCurThread2Set curThreadAndTerm l r (HS.fromList [l, r])
 {-# NOINLINE andTerm #-}
 
 -- | Construct and internalizing a 'EqTerm'.
@@ -5336,7 +5757,8 @@ leOrdTerm = unsafeInCurThread2 curThreadLeOrdTerm
 
 -- | Construct and internalizing a 'AndBitsTerm'.
 andBitsTerm :: (PEvalBitwiseTerm a) => Term a -> Term a -> Term a
-andBitsTerm = unsafeInCurThread2 curThreadAndBitsTerm
+andBitsTerm a b =
+  unsafeInCurThread2 curThreadAndBitsTerm a b
 {-# NOINLINE andBitsTerm #-}
 
 -- | Construct and internalizing a 'OrBitsTerm'.
@@ -5646,13 +6068,25 @@ boolConTermView _ = Nothing
 pattern BoolConTerm :: Bool -> Term a
 pattern BoolConTerm b <- (boolConTermView -> Just b)
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE BoolConTerm #-}
+#endif
+
 -- | Pattern matcher for 'True' term.
 pattern TrueTerm :: Term a
 pattern TrueTerm <- BoolConTerm True
 
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE TrueTerm #-}
+#endif
+
 -- | Pattern matcher for 'False' term.
 pattern FalseTerm :: Term a
 pattern FalseTerm <- BoolConTerm False
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE FalseTerm #-}
+#endif
 
 boolTermView :: forall a. Term a -> Maybe (Term Bool)
 boolTermView t@SupportedTerm = cast t
@@ -5661,6 +6095,10 @@ boolTermView t@SupportedTerm = cast t
 -- | Pattern matcher for 'Bool' terms.
 pattern BoolTerm :: Term Bool -> Term a
 pattern BoolTerm b <- (boolTermView -> Just b)
+
+#if MIN_VERSION_base(4, 16, 4)
+{-# INLINE BoolTerm #-}
+#endif
 
 -- | Partial evaluation for not terms.
 pevalNotTerm :: Term Bool -> Term Bool
@@ -5678,98 +6116,102 @@ pevalNotTerm (AndTerm (DistinctTerm (n1 :| [n2])) n3) =
 pevalNotTerm (AndTerm n1 (NotTerm n2)) = pevalOrTerm (pevalNotTerm n1) n2
 pevalNotTerm (AndTerm n1 (DistinctTerm (n2 :| [n3]))) =
   pevalOrTerm (pevalNotTerm n1) (pevalEqTerm n2 n3)
-pevalNotTerm (EqTerm a b) = distinctTerm $ a :| [b]
+pevalNotTerm
+  (EqTerm a (DynTerm (ConTerm b :: Term (WordN 1))))
+    | b == 0 = eqTerm (unsafeCoerce a) (conTerm 1 :: Term (WordN 1))
+    | b == 1 = eqTerm (unsafeCoerce a) (conTerm 0 :: Term (WordN 1))
+pevalNotTerm
+  (EqTerm a (DynTerm (ConTerm b :: Term (IntN 1))))
+    | b == 0 = eqTerm (unsafeCoerce a) (conTerm 1 :: Term (IntN 1))
+    | b == 1 = eqTerm (unsafeCoerce a) (conTerm 0 :: Term (IntN 1))
+-- pevalNotTerm (EqTerm a b) = distinctTerm $ a :| [b]
 pevalNotTerm (DistinctTerm (a :| [b])) = eqTerm a b
 pevalNotTerm tm = notTerm tm
 {-# INLINEABLE pevalNotTerm #-}
 
-orEqFirst :: Term Bool -> Term Bool -> Bool
-orEqFirst _ (ConTerm False) = True
-orEqFirst
+orEqFirst' :: Term Bool -> Term Bool -> Bool
+orEqFirst'
   (DistinctTerm ((e1 :: Term a) :| [ec1@ConTerm {} :: Term b]))
   (EqTerm (DynTerm (e2 :: Term a)) (DynTerm (ec2@ConTerm {} :: Term b)))
     | e1 == e2 && ec1 /= ec2 = True
--- orEqFirst
---   (NotTerm _ (EqTerm _ (e1 :: Term a) (ec1@(ConTerm _ _ _) :: Term b)))
---   (EqTerm _ (Dyn (e2 :: Term a)) (Dyn (ec2@(ConTerm _ _ _) :: Term b)))
---     | e1 == e2 && ec1 /= ec2 = True
+orEqFirst'
+  (NotTerm (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b)))
+  (EqTerm (DynTerm (e2 :: Term a)) (DynTerm (ec2@ConTerm {} :: Term b)))
+    | e1 == e2 && ec1 /= ec2 = True
+orEqFirst' _ _ = False
+{-# INLINE orEqFirst' #-}
+
+orEqFirst :: Term Bool -> Term Bool -> Bool
+orEqFirst _ (ConTerm False) = True
 orEqFirst x y
   | x == y = True
-  | otherwise = False
+  | otherwise = orEqFirst' x y
 {-# INLINE orEqFirst #-}
+
+orEqTrue' :: Term Bool -> Term Bool -> Bool
+orEqTrue'
+  (DistinctTerm ((e1 :: Term a) :| [ec1@ConTerm {} :: Term b]))
+  (DistinctTerm ((DynTerm (e2 :: Term a)) :| [DynTerm (ec2@ConTerm {} :: Term b)]))
+    | e1 == e2 && ec1 /= ec2 = True
+orEqTrue'
+  (NotTerm (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b)))
+  (NotTerm (EqTerm (DynTerm (e2 :: Term a)) (DynTerm (ec2@ConTerm {} :: Term b))))
+    | e1 == e2 && ec1 /= ec2 = True
+orEqTrue' _ _ = False
+{-# INLINE orEqTrue' #-}
 
 orEqTrue :: Term Bool -> Term Bool -> Bool
 orEqTrue (ConTerm True) ~_ = True
 orEqTrue _ (ConTerm True) = True
--- orEqTrue (NotTerm _ e1) (NotTerm _ e2) = andEqFalse e1 e2
-orEqTrue
-  (DistinctTerm ((e1 :: Term a) :| [ec1@ConTerm {} :: Term b]))
-  (DistinctTerm ((DynTerm (e2 :: Term a)) :| [DynTerm (ec2@ConTerm {} :: Term b)]))
-    | e1 == e2 && ec1 /= ec2 = True
--- orEqTrue
---   (NotTerm _ (EqTerm _ (e1 :: Term a) (ec1@(ConTerm _ _ _ _) :: Term b)))
---   (NotTerm _ (EqTerm _ (Dyn (e2 :: Term a)) (Dyn (ec2@(ConTerm _ _ _ _) :: Term b))))
---     | e1 == e2 && ec1 /= ec2 = True
 orEqTrue (NotTerm l) r | l == r = True
 orEqTrue l (NotTerm r) | l == r = True
-orEqTrue _ _ = False
+orEqTrue l r = orEqTrue' l r
 {-# INLINE orEqTrue #-}
-
-andEqFirst :: Term Bool -> Term Bool -> Bool
-andEqFirst _ (ConTerm True) = True
--- andEqFirst x (NotTerm _ y) = andEqFalse x y
-andEqFirst
-  (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b))
-  (DistinctTerm ((DynTerm (e2 :: Term a)) :| [DynTerm (ec2@ConTerm {} :: Term b)]))
-    | e1 == e2 && ec1 /= ec2 = True
--- andEqFirst
---   (EqTerm _ (e1 :: Term a) (ec1@(ConTerm _ _ _ _) :: Term b))
---   (NotTerm _ (EqTerm _ (Dyn (e2 :: Term a)) (Dyn (ec2@(ConTerm _ _ _ _) :: Term b))))
---     | e1 == e2 && ec1 /= ec2 = True
-andEqFirst x y
-  | x == y = True
-  | otherwise = False
-{-# INLINE andEqFirst #-}
-
-andEqFalse :: Term Bool -> Term Bool -> Bool
-andEqFalse (ConTerm False) ~_ = True
-andEqFalse _ (ConTerm False) = True
--- andEqFalse (NotTerm _ e1) (NotTerm _ e2) = orEqTrue e1 e2
-andEqFalse
-  (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b))
-  (EqTerm (DynTerm (e2 :: Term a)) (DynTerm (ec2@ConTerm {} :: Term b)))
-    | e1 == e2 && ec1 /= ec2 = True
-andEqFalse (NotTerm x) y | x == y = True
-andEqFalse x (NotTerm y) | x == y = True
-andEqFalse _ _ = False
-{-# INLINE andEqFalse #-}
 
 -- | Partial evaluation for or terms.
 pevalOrTerm :: Term Bool -> Term Bool -> Term Bool
+pevalOrTerm (ConTerm True) ~_ = trueTerm
+pevalOrTerm _ (ConTerm True) = trueTerm
+pevalOrTerm (ConTerm False) y = y
+pevalOrTerm x (ConTerm False) = x
+pevalOrTerm (NotTerm x) y | x == y = trueTerm
+pevalOrTerm x (NotTerm y) | x == y = trueTerm
+pevalOrTerm x y | x == y = x
 pevalOrTerm l ~r
-  | orEqTrue l r = trueTerm
-  | orEqFirst l r = l
-  | orEqFirst r l = r
-pevalOrTerm l r@(OrTerm r1 r2)
-  | orEqTrue l r1 = trueTerm
-  | orEqTrue l r2 = trueTerm
-  | orEqFirst r1 l = r
-  | orEqFirst r2 l = r
-  | orEqFirst l r1 = pevalOrTerm l r2
-  | orEqFirst l r2 = pevalOrTerm l r1
-pevalOrTerm l@(OrTerm l1 l2) r
-  | orEqTrue l1 r = trueTerm
-  | orEqTrue l2 r = trueTerm
-  | orEqFirst l1 r = l
-  | orEqFirst l2 r = l
-  | orEqFirst r l1 = pevalOrTerm l2 r
-  | orEqFirst r l2 = pevalOrTerm l1 r
-pevalOrTerm l (AndTerm r1 r2)
+  | orEqTrue' l r = trueTerm
+  | orEqFirst' l r = l
+  | orEqFirst' r l = r
+pevalOrTerm l r@(OrTermAll r1 r2 s)
+  | HS.member l s = r
+  | HS.member (simpleNot l) s = trueTerm
+  | orEqTrue' l r1 = trueTerm
+  | orEqTrue' l r2 = trueTerm
+  | orEqFirst' r1 l = r
+  | orEqFirst' r2 l = r
+  | orEqFirst' l r1 = pevalOrTerm l r2
+  | orEqFirst' l r2 = pevalOrTerm l r1
+pevalOrTerm l@(OrTermAll l1 l2 s) r
+  | HS.member r s = l
+  | HS.member (simpleNot r) s = trueTerm
+  | orEqTrue' l1 r = trueTerm
+  | orEqTrue' l2 r = trueTerm
+  | orEqFirst' l1 r = l
+  | orEqFirst' l2 r = l
+  | orEqFirst' r l1 = pevalOrTerm l2 r
+  | orEqFirst' r l2 = pevalOrTerm l1 r
+pevalOrTerm (AndTerm l1 l2) (AndTerm r1 r2)
+  | l1 == r1 = pevalAndTerm l1 (pevalOrTerm l2 r2)
+  | l1 == r2 = pevalAndTerm l1 (pevalOrTerm l2 r1)
+  | l2 == r1 = pevalAndTerm l2 (pevalOrTerm l1 r2)
+  | l2 == r2 = pevalAndTerm l2 (pevalOrTerm l1 r1)
+pevalOrTerm l (AndTermAll r1 r2 s)
+  | HS.member l s = l
   | orEqFirst l r1 = l
   | orEqFirst l r2 = l
   | orEqTrue l r1 = pevalOrTerm l r2
   | orEqTrue l r2 = pevalOrTerm l r1
-pevalOrTerm (AndTerm l1 l2) r
+pevalOrTerm (AndTermAll l1 l2 s) r
+  | HS.member r s = r
   | orEqFirst r l1 = r
   | orEqFirst r l2 = r
   | orEqTrue l1 r = pevalOrTerm l2 r
@@ -5780,35 +6222,115 @@ pevalOrTerm
     | l1 == e1 && l2 == e2 = pevalOrTerm nl1 l2
 pevalOrTerm (NotTerm nl) (NotTerm nr) =
   pevalNotTerm $ pevalAndTerm nl nr
+pevalOrTerm (AndTermAll _ _ sa) r@(OrTermAll _ _ so)
+  | sa `HS.intersection` so /= HS.empty = r
+pevalOrTerm l@(OrTermAll _ _ so) (AndTermAll _ _ sa)
+  | sa `HS.intersection` so /= HS.empty = l
+pevalOrTerm
+  (EqTerm a (BVTerm bt@(ConTerm (b :: bv n))))
+  (EqTerm c (DynTerm (BVTerm (ConTerm d) :: Term (bv n))))
+    | natVal (Proxy @n) == 1 && b == -1 && d == -1 =
+        pevalEqTerm
+          ( pevalOrBitsTerm
+              (unsafeCoerce a :: Term (bv n))
+              (unsafeCoerce c :: Term (bv n))
+          )
+          bt
+pevalOrTerm
+  (EqTerm a (BVTerm bt@(ConTerm (b :: bv n))))
+  (EqTerm c (DynTerm (BVTerm (ConTerm d) :: Term (bv n))))
+    | natVal (Proxy @n) == 1 && b == 0 && d == 0 =
+        pevalEqTerm
+          ( pevalAndBitsTerm
+              (unsafeCoerce a :: Term (bv n))
+              (unsafeCoerce c :: Term (bv n))
+          )
+          bt
 pevalOrTerm l r = orTerm l r
 {-# INLINEABLE pevalOrTerm #-}
 
+andEqFalse' :: Term Bool -> Term Bool -> Bool
+andEqFalse'
+  (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b))
+  (EqTerm (DynTerm (e2 :: Term a)) (DynTerm (ec2@ConTerm {} :: Term b)))
+    | e1 == e2 && ec1 /= ec2 = True
+andEqFalse' _ _ = False
+{-# INLINE andEqFalse' #-}
+
+andEqFalse :: Term Bool -> Term Bool -> Bool
+andEqFalse (NotTerm x) y | x == y = True
+andEqFalse x (NotTerm y) | x == y = True
+andEqFalse l r = andEqFalse' l r
+{-# INLINE andEqFalse #-}
+
+andEqFirst' :: Term Bool -> Term Bool -> Bool
+andEqFirst'
+  (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b))
+  (DistinctTerm ((DynTerm (e2 :: Term a)) :| [DynTerm (ec2@ConTerm {} :: Term b)]))
+    | e1 == e2 && ec1 /= ec2 = True
+andEqFirst'
+  (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b))
+  (NotTerm (EqTerm (DynTerm (e2 :: Term a)) (DynTerm (ec2@ConTerm {} :: Term b))))
+    | e1 == e2 && ec1 /= ec2 = True
+andEqFirst' _ _ = False
+{-# INLINE andEqFirst' #-}
+
+andEqFirst :: Term Bool -> Term Bool -> Bool
+andEqFirst _ (ConTerm True) = True
+andEqFirst x y
+  | x == y = True
+  | otherwise = andEqFirst' x y
+{-# INLINE andEqFirst #-}
+
+simpleNot :: Term Bool -> Term Bool
+simpleNot (NotTerm n) = n
+simpleNot n = notTerm n
+{-# INLINEABLE simpleNot #-}
+
 -- | Partial evaluation for and terms.
 pevalAndTerm :: Term Bool -> Term Bool -> Term Bool
+pevalAndTerm (ConTerm False) ~_ = falseTerm
+pevalAndTerm _ (ConTerm False) = falseTerm
+pevalAndTerm (ConTerm True) y = y
+pevalAndTerm x (ConTerm True) = x
+pevalAndTerm (NotTerm x) y | x == y = falseTerm
+pevalAndTerm x (NotTerm y) | x == y = falseTerm
+pevalAndTerm x y | x == y = x
 pevalAndTerm l ~r
-  | andEqFalse l r = falseTerm
-  | andEqFirst l r = l
-  | andEqFirst r l = r
-pevalAndTerm l r@(AndTerm r1 r2)
-  | andEqFalse l r1 = falseTerm
-  | andEqFalse l r2 = falseTerm
-  | andEqFirst r1 l = r
-  | andEqFirst r2 l = r
-  | andEqFirst l r1 = pevalAndTerm l r2
-  | andEqFirst l r2 = pevalAndTerm l r1
-pevalAndTerm l@(AndTerm l1 l2) r
-  | andEqFalse l1 r = falseTerm
-  | andEqFalse l2 r = falseTerm
-  | andEqFirst l1 r = l
-  | andEqFirst l2 r = l
-  | andEqFirst r l1 = pevalAndTerm l2 r
-  | andEqFirst r l2 = pevalAndTerm l1 r
-pevalAndTerm l (OrTerm r1 r2)
+  | andEqFalse' l r = falseTerm
+  | andEqFirst' l r = l
+  | andEqFirst' r l = r
+pevalAndTerm l r@(AndTermAll r1 r2 s)
+  | HS.member l s = r
+  | HS.member (simpleNot l) s = falseTerm
+  | andEqFalse' l r1 = falseTerm
+  | andEqFalse' l r2 = falseTerm
+  | andEqFirst' r1 l = r
+  | andEqFirst' r2 l = r
+  | andEqFirst' l r1 = pevalAndTerm l r2
+  | andEqFirst' l r2 = pevalAndTerm l r1
+pevalAndTerm l@(AndTermAll l1 l2 s) r
+  | HS.member r s = l
+  | HS.member (simpleNot r) s = falseTerm
+  | andEqFalse' l1 r = falseTerm
+  | andEqFalse' l2 r = falseTerm
+  | andEqFirst' l1 r = l
+  | andEqFirst' l2 r = l
+  | andEqFirst' r l1 = pevalAndTerm l2 r
+  | andEqFirst' r l2 = pevalAndTerm l1 r
+pevalAndTerm (OrTerm l1 l2) (OrTerm r1 r2)
+  | l1 == r1 = pevalOrTerm l1 (pevalAndTerm l2 r2)
+  | l1 == r2 = pevalOrTerm l1 (pevalAndTerm l2 r1)
+  | l2 == r1 = pevalOrTerm l2 (pevalAndTerm l1 r2)
+  | l2 == r2 = pevalOrTerm l2 (pevalAndTerm l1 r1)
+pevalAndTerm l (OrTermAll r1 r2 s)
+  | HS.member l s = l
   | andEqFirst l r1 = l
   | andEqFirst l r2 = l
   | andEqFalse l r1 = pevalAndTerm l r2
   | andEqFalse l r2 = pevalAndTerm l r1
-pevalAndTerm (OrTerm l1 l2) r
+pevalAndTerm (OrTermAll l1 l2 s) r
+  | HS.member r s = r
   | andEqFirst r l1 = r
   | andEqFirst r l2 = r
   | andEqFalse l1 r = pevalAndTerm l2 r
@@ -5818,32 +6340,95 @@ pevalAndTerm
   (NotTerm (EqTerm (DynTerm (e1 :: Term Bool)) (DynTerm (e2 :: Term Bool))))
     | l1 == e1 && l2 == e2 = pevalAndTerm l1 nl2
 pevalAndTerm (NotTerm nl) (NotTerm nr) = pevalNotTerm $ pevalOrTerm nl nr
+pevalAndTerm (OrTermAll _ _ so) r@(AndTermAll _ _ sa)
+  | sa `HS.intersection` so /= HS.empty = r
+pevalAndTerm l@(AndTermAll _ _ sa) (OrTermAll _ _ so)
+  | sa `HS.intersection` so /= HS.empty = l
+pevalAndTerm
+  (EqTerm a (BVTerm bt@(ConTerm (b :: bv n))))
+  (EqTerm c (DynTerm (BVTerm (ConTerm d) :: Term (bv n))))
+    | natVal (Proxy @n) == 1 && b == 0 && d == 0 =
+        pevalEqTerm
+          ( pevalOrBitsTerm
+              (unsafeCoerce a :: Term (bv n))
+              (unsafeCoerce c :: Term (bv n))
+          )
+          bt
+pevalAndTerm
+  (EqTerm a (BVTerm bt@(ConTerm (b :: bv n))))
+  (EqTerm c (DynTerm (BVTerm (ConTerm d) :: Term (bv n))))
+    | natVal (Proxy @n) == 1 && b == -1 && d == -1 =
+        pevalEqTerm
+          ( pevalAndBitsTerm
+              (unsafeCoerce a :: Term (bv n))
+              (unsafeCoerce c :: Term (bv n))
+          )
+          bt
 pevalAndTerm l r = andTerm l r
 {-# INLINEABLE pevalAndTerm #-}
 
+data BVTermView where
+  BVTermView ::
+    forall bv n.
+    ( KnownNat n,
+      1 <= n,
+      PEvalBitwiseTerm (bv n),
+      Eq (bv n),
+      Num (bv n)
+    ) =>
+    Term (bv n) -> BVTermView
+
+bvTermViewPattern ::
+  forall a.
+  (SupportedPrim a) =>
+  Term a ->
+  Maybe BVTermView
+bvTermViewPattern b = case R.typeRep @a of
+  R.App i _ -> case ( R.eqTypeRep i (R.typeRep @IntN),
+                      R.eqTypeRep i (R.typeRep @WordN)
+                    ) of
+    (Just R.HRefl, _) -> withPrim @a $ Just (BVTermView b)
+    (_, Just R.HRefl) -> withPrim @a $ Just (BVTermView b)
+    _ -> Nothing
+  _ -> Nothing
+
+pattern BVTerm ::
+  forall a.
+  (SupportedPrim a) =>
+  forall bv n.
+  (KnownNat n, 1 <= n, PEvalBitwiseTerm (bv n), Eq (bv n), Num (bv n)) =>
+  Term (bv n) -> Term a
+pattern BVTerm x <- (bvTermViewPattern -> Just (BVTermView x))
+
 -- | Partial evaluation for imply terms.
 pevalImplyTerm :: Term Bool -> Term Bool -> Term Bool
-pevalImplyTerm l = pevalOrTerm (pevalNotTerm l)
+pevalImplyTerm l r | termImplies l r = trueTerm
+pevalImplyTerm l r = pevalOrTerm (pevalNotTerm l) r
 
 -- | Partial evaluation for xor terms.
 pevalXorTerm :: Term Bool -> Term Bool -> Term Bool
 pevalXorTerm l r = pevalOrTerm (pevalAndTerm (pevalNotTerm l) r) (pevalAndTerm l (pevalNotTerm r))
 
-pevalImpliesTerm :: Term Bool -> Term Bool -> Bool
-pevalImpliesTerm (ConTerm False) _ = True
-pevalImpliesTerm _ (ConTerm True) = True
-pevalImpliesTerm
+termImplies :: Term Bool -> Term Bool -> Bool
+termImplies (ConTerm False) _ = True
+termImplies _ (ConTerm True) = True
+termImplies
   (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b))
   (DistinctTerm ((DynTerm (e2 :: Term a)) :| [(DynTerm (ec2@ConTerm {} :: Term b))]))
     | e1 == e2 && ec1 /= ec2 = True
--- pevalImpliesTerm
---   (EqTerm _ (e1 :: Term a) (ec1@(ConTerm _ _ _ _) :: Term b))
---   (NotTerm _ (EqTerm _ (Dyn (e2 :: Term a)) (Dyn (ec2@(ConTerm _ _ _ _) :: Term b))))
---     | e1 == e2 && ec1 /= ec2 = True
-pevalImpliesTerm a b
+termImplies
+  (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b))
+  (NotTerm (EqTerm (DynTerm (e2 :: Term a)) ((DynTerm (ec2@ConTerm {} :: Term b)))))
+    | e1 == e2 && ec1 /= ec2 = True
+termImplies a (OrTermAll _ _ s) | HS.member a s = True
+termImplies (AndTermAll _ _ s) b | HS.member b s = True
+termImplies (AndTermAll _ _ s) (OrTermAll _ _ s2) | HS.intersection s s2 /= HS.empty = True
+termImplies (AndTermAll _ _ s) (AndTermAll _ _ s2) | s2 `HS.isSubsetOf` s = True
+termImplies (OrTermAll _ _ s) (OrTermAll _ _ s2) | s `HS.isSubsetOf` s2 = True
+termImplies a b
   | a == b = True
   | otherwise = False
-{-# INLINE pevalImpliesTerm #-}
+{-# INLINE termImplies #-}
 
 pevalITEBoolLeftNot :: Term Bool -> Term Bool -> Term Bool -> Maybe (Term Bool)
 pevalITEBoolLeftNot cond nIfTrue ifFalse
@@ -5853,22 +6438,22 @@ pevalITEBoolLeftNot cond nIfTrue ifFalse
       AndTerm nt1 nt2 -> ra
         where
           ra
-            | pevalImpliesTerm cond nt1 =
+            | termImplies cond nt1 =
                 Just $ pevalITETerm cond (pevalNotTerm nt2) ifFalse
-            | pevalImpliesTerm cond nt2 =
+            | termImplies cond nt2 =
                 Just $ pevalITETerm cond (pevalNotTerm nt1) ifFalse
-            | pevalImpliesTerm cond (pevalNotTerm nt1)
-                || pevalImpliesTerm cond (pevalNotTerm nt2) =
+            | termImplies cond (pevalNotTerm nt1)
+                || termImplies cond (pevalNotTerm nt2) =
                 Just $ pevalOrTerm cond ifFalse
             | otherwise = Nothing
       OrTerm nt1 nt2 -> ra
         where
           ra
-            | pevalImpliesTerm cond nt1 || pevalImpliesTerm cond nt2 =
+            | termImplies cond nt1 || termImplies cond nt2 =
                 Just $ pevalAndTerm (pevalNotTerm cond) ifFalse
-            | pevalImpliesTerm cond (pevalNotTerm nt1) =
+            | termImplies cond (pevalNotTerm nt1) =
                 Just $ pevalITETerm cond (pevalNotTerm nt2) ifFalse
-            | pevalImpliesTerm cond (pevalNotTerm nt2) =
+            | termImplies cond (pevalNotTerm nt2) =
                 Just $ pevalITETerm cond (pevalNotTerm nt1) ifFalse
             | otherwise = Nothing
       _ -> Nothing
@@ -5884,6 +6469,12 @@ pevalITEBoolRightNot cond ifTrue nIfFalse
   | otherwise = Nothing -- need work
 
 pevalInferImplies :: Term Bool -> Term Bool -> Term Bool -> Term Bool -> Maybe (Term Bool)
+pevalInferImplies
+  (EqTerm (e1 :: Term a) (ec1@ConTerm {} :: Term b))
+  (NotTerm (EqTerm (DynTerm (e2 :: Term a)) (DynTerm (ec2@ConTerm {} :: Term b))))
+  trueRes
+  _
+    | e1 == e2 && ec1 /= ec2 = Just trueRes
 pevalInferImplies cond (NotTerm nt1) _ falseRes
   | cond == nt1 = Just falseRes
   | otherwise = Nothing
@@ -5999,13 +6590,19 @@ pevalITEBasic _ ifTrue ifFalse | ifTrue == ifFalse = Just ifTrue
 pevalITEBasic (ITETerm cc ct cf) (ITETerm tc tt tf) (ITETerm fc ft ff) -- later
   | cc == tc && cc == fc = Just $ pevalITETerm cc (pevalITETerm ct tt ft) (pevalITETerm cf tf ff)
 pevalITEBasic cond (ITETerm tc tt tf) ifFalse -- later
-  | cond == tc = Just $ pevalITETerm cond tt ifFalse
   | tt == ifFalse = Just $ pevalITETerm (pevalOrTerm (pevalNotTerm cond) tc) tt tf
   | tf == ifFalse = Just $ pevalITETerm (pevalAndTerm cond tc) tt tf
+  | termImplies cond tc = Just $ pevalITETerm cond tt ifFalse
+pevalITEBasic cond (ITETerm (AndTerm c1 c2) tt tf) ifFalse
+  | cond == c1 = Just $ pevalITETerm cond (pevalITETerm c2 tt tf) ifFalse
+  | cond == c2 = Just $ pevalITETerm cond (pevalITETerm c1 tt tf) ifFalse
 pevalITEBasic cond ifTrue (ITETerm fc ft ff) -- later
   | ifTrue == ft = Just $ pevalITETerm (pevalOrTerm cond fc) ifTrue ff
   | ifTrue == ff = Just $ pevalITETerm (pevalOrTerm cond (pevalNotTerm fc)) ifTrue ft
-  | pevalImpliesTerm fc cond = Just $ pevalITETerm cond ifTrue ff
+  | termImplies fc cond = Just $ pevalITETerm cond ifTrue ff
+pevalITEBasic cond ifTrue (ITETerm (OrTerm c1 c2) ft ff)
+  | cond == c1 = Just $ pevalITETerm cond ifTrue (pevalITETerm c2 ft ff)
+  | cond == c2 = Just $ pevalITETerm cond ifTrue (pevalITETerm c1 ft ff)
 pevalITEBasic _ _ _ = Nothing
 
 pevalITEBoolBasic :: Term Bool -> Term Bool -> Term Bool -> Maybe (Term Bool)
@@ -6072,7 +6669,22 @@ instance SupportedPrim Bool where
   pevalITETerm cond ~ifTrue ~ifFalse =
     fromMaybe (iteTerm cond ifTrue ifFalse) $
       pevalITEBool cond ifTrue ifFalse
-  pevalEqTerm = pevalDefaultEqTerm
+  pevalEqTerm (EqTerm (DynTerm (l1 :: Term Bool)) l2) (EqTerm r1 r2)
+    | l1 == unsafeCoerce r1 = pevalEqTerm l2 (unsafeCoerce r2)
+    | l1 == unsafeCoerce r2 = pevalEqTerm l2 (unsafeCoerce r1)
+    | l2 == unsafeCoerce r1 = pevalEqTerm (unsafeCoerce l1) r2
+    | l2 == unsafeCoerce r2 = pevalEqTerm (unsafeCoerce l1) r1
+  pevalEqTerm (EqTerm (DynTerm (l1 :: Term (WordN 1))) l2) (EqTerm r1 r2)
+    | l1 == unsafeCoerce r1 = pevalEqTerm l2 (unsafeCoerce r2)
+    | l1 == unsafeCoerce r2 = pevalEqTerm l2 (unsafeCoerce r1)
+    | l2 == unsafeCoerce r1 = pevalEqTerm (unsafeCoerce l1) r2
+    | l2 == unsafeCoerce r2 = pevalEqTerm (unsafeCoerce l1) r1
+  pevalEqTerm (EqTerm (DynTerm (l1 :: Term (IntN 1))) l2) (EqTerm r1 r2)
+    | l1 == unsafeCoerce r1 = pevalEqTerm l2 (unsafeCoerce r2)
+    | l1 == unsafeCoerce r2 = pevalEqTerm l2 (unsafeCoerce r1)
+    | l2 == unsafeCoerce r1 = pevalEqTerm (unsafeCoerce l1) r2
+    | l2 == unsafeCoerce r2 = pevalEqTerm (unsafeCoerce l1) r1
+  pevalEqTerm l r = pevalDefaultEqTerm l r
   pevalDistinctTerm (_ :| []) = conTerm True
   pevalDistinctTerm (a :| [b]) = pevalNotTerm $ pevalEqTerm a b
   pevalDistinctTerm _ = conTerm False
@@ -6144,3 +6756,1647 @@ getPhantomNonFuncDict = unsafePerformIO $ do
         HM.insert tr $
           unsafeCoerce r
       return r
+
+defaultValueForInteger :: Integer
+defaultValueForInteger = 0
+
+-- Basic Integer
+instance SBVRep Integer where
+  type SBVType Integer = SBV.SBV Integer
+
+instance SupportedPrimConstraint Integer where
+  type PrimConstraint Integer = (Integral (NonFuncSBVBaseType Integer))
+
+pairwiseHasConcreteEqual :: (SupportedNonFuncPrim a) => [Term a] -> Bool
+pairwiseHasConcreteEqual [] = False
+pairwiseHasConcreteEqual [_] = False
+pairwiseHasConcreteEqual (x : xs) =
+  go x xs || pairwiseHasConcreteEqual xs
+  where
+    go _ [] = False
+    go x (y : ys) = x == y || go x ys
+
+getAllConcrete :: [Term a] -> Maybe [a]
+getAllConcrete [] = return []
+getAllConcrete (ConTerm x : xs) = (x :) <$> getAllConcrete xs
+getAllConcrete _ = Nothing
+
+checkConcreteDistinct :: (Eq t) => [t] -> Bool
+checkConcreteDistinct [] = True
+checkConcreteDistinct (x : xs) = check0 x xs && checkConcreteDistinct xs
+  where
+    check0 _ [] = True
+    check0 x (y : ys) = x /= y && check0 x ys
+
+pevalGeneralDistinct ::
+  (SupportedNonFuncPrim a) => NonEmpty (Term a) -> Term Bool
+pevalGeneralDistinct (_ :| []) = conTerm True
+pevalGeneralDistinct (a :| [b]) = pevalNotTerm $ pevalEqTerm a b
+pevalGeneralDistinct l | pairwiseHasConcreteEqual $ toList l = conTerm False
+pevalGeneralDistinct l =
+  case getAllConcrete (toList l) of
+    Nothing -> distinctTerm l
+    Just xs -> conTerm $ checkConcreteDistinct xs
+
+instance SupportedPrim Integer where
+  pformatCon = show
+  defaultValue = defaultValueForInteger
+  pevalITETerm = pevalITEBasicTerm
+  pevalEqTerm = pevalDefaultEqTerm
+  pevalDistinctTerm = pevalGeneralDistinct
+  conSBVTerm n = fromInteger n
+  symSBVName symbol _ = show symbol
+  symSBVTerm name = sbvFresh name
+  parseSMTModelResult _ = parseScalarSMTModelResult id
+  castTypedSymbol ::
+    forall knd knd'.
+    (IsSymbolKind knd') =>
+    TypedSymbol knd Integer ->
+    Maybe (TypedSymbol knd' Integer)
+  castTypedSymbol s =
+    case decideSymbolKind @knd' of
+      Left HRefl -> Just $ typedConstantSymbol $ unTypedSymbol s
+      Right HRefl -> Just $ typedAnySymbol $ unTypedSymbol s
+  funcDummyConstraint _ = SBV.sTrue
+
+instance NonFuncSBVRep Integer where
+  type NonFuncSBVBaseType Integer = Integer
+
+instance SupportedNonFuncPrim Integer where
+  conNonFuncSBVTerm = conSBVTerm
+  symNonFuncSBVTerm = symSBVTerm @Integer
+  withNonFuncPrim r = r
+
+pevalITEBVTerm ::
+  forall bv n.
+  ( KnownNat n,
+    1 <= n,
+    forall m. (KnownNat m, 1 <= m) => SupportedPrim (bv m),
+    forall m. (KnownNat m, 1 <= m) => Show (bv m),
+    PEvalBVTerm bv
+  ) =>
+  Term Bool -> Term (bv n) -> Term (bv n) -> Maybe (Term (bv n))
+pevalITEBVTerm
+  ( EqTerm
+      (DynTerm (l :: Term (bv n)))
+      (DynTerm (ConTerm (r :: bv n)))
+    )
+  (ConTerm t)
+  (ConTerm f)
+    | natVal (Proxy @n) == 1 && r == 1 && t == 0 && f == 1 = Just $ pevalComplementBitsTerm l
+    | natVal (Proxy @n) == 1 && r == 1 && t == 1 && f == 0 = Just l
+    | natVal (Proxy @n) == 1 && r == 0 && t == 0 && f == 1 = Just l
+    | natVal (Proxy @n) == 1 && r == 0 && t == 1 && f == 0 = Just $ pevalComplementBitsTerm l
+pevalITEBVTerm
+  (EqTerm (DynTerm (l :: Term (bv 1))) (DynTerm (ConTerm (r :: bv 1))))
+  (ConTerm t)
+  f
+    | n > 1 && (t == 0 || t == -1) && (r == -1 || r == 0) =
+        Just $
+          (if t == 0 then pevalAndBitsTerm else pevalOrBitsTerm)
+            ( unsafePevalBVExtendTerm
+                (natRepr @1)
+                (natRepr @n)
+                True
+                (if (r == 0) == (t == 0) then l else pevalComplementBitsTerm l)
+            )
+            f
+    where
+      n = natVal (Proxy @n)
+pevalITEBVTerm
+  (EqTerm (DynTerm (_ :: Term (bv 1))) (DynTerm (ConTerm (_ :: bv 1))))
+  (ConTerm _)
+  (ConTerm _) = Nothing
+pevalITEBVTerm
+  (EqTerm (DynTerm (l :: Term (bv 1))) (DynTerm (ConTerm (r :: bv 1))))
+  t
+  f@(ConTerm _) = pevalITEBVTerm (eqTerm l (conTerm $ complement r)) f t
+pevalITEBVTerm
+  cond
+  (BVConcatTerm (a :: Term (bv a)) (b :: Term (bv b)))
+  (BVConcatTerm (DynTerm (c :: Term (bv a))) d) =
+    Just $
+      pevalBVConcatTerm
+        (pevalITETerm cond a c)
+        (pevalITETerm cond b (unsafeCoerce d))
+pevalITEBVTerm
+  cond
+  (BVExtendTerm True pl (a :: Term (bv a)))
+  (BVExtendTerm True _ (DynTerm (b :: Term (bv a)))) =
+    Just $
+      pevalBVExtendTerm
+        True
+        pl
+        (pevalITETerm cond a b)
+pevalITEBVTerm cond (AndBitsTerm a b) (AndBitsTerm c d)
+  | a == c = Just $ andBitsTerm a $ pevalITETerm cond b d
+  | a == d = Just $ andBitsTerm a $ pevalITETerm cond b c
+  | b == c = Just $ andBitsTerm b $ pevalITETerm cond a d
+  | b == d = Just $ andBitsTerm b $ pevalITETerm cond a c
+pevalITEBVTerm cond (AndBitsTerm a b) c
+  | a == c = Just $ andBitsTerm c $ pevalOrBitsTerm (boolToBVTerm $ pevalNotTerm cond) b
+  | b == c = Just $ andBitsTerm c $ pevalOrBitsTerm (boolToBVTerm $ pevalNotTerm cond) a
+pevalITEBVTerm cond a (AndBitsTerm b c)
+  | a == b = Just $ andBitsTerm a $ pevalOrBitsTerm (boolToBVTerm cond) c
+  | a == c = Just $ andBitsTerm a $ pevalOrBitsTerm (boolToBVTerm cond) b
+pevalITEBVTerm cond (OrBitsTerm a b) (OrBitsTerm c d)
+  | a == c = Just $ orBitsTerm a $ pevalITETerm cond b d
+  | a == d = Just $ orBitsTerm a $ pevalITETerm cond b c
+  | b == c = Just $ orBitsTerm b $ pevalITETerm cond a d
+  | b == d = Just $ orBitsTerm b $ pevalITETerm cond a c
+pevalITEBVTerm cond (OrBitsTerm a b) c
+  | a == c = Just $ orBitsTerm c $ pevalAndBitsTerm (boolToBVTerm cond) b
+  | b == c = Just $ orBitsTerm c $ pevalAndBitsTerm (boolToBVTerm cond) a
+pevalITEBVTerm cond a (OrBitsTerm b c)
+  | a == b = Just $ orBitsTerm a $ pevalAndBitsTerm (boolToBVTerm $ pevalNotTerm cond) c
+  | a == c = Just $ orBitsTerm a $ pevalAndBitsTerm (boolToBVTerm $ pevalNotTerm cond) b
+pevalITEBVTerm _ _ _ = Nothing
+
+boolToBVTerm ::
+  forall bv n.
+  ( PEvalBVTerm bv,
+    KnownNat n,
+    1 <= n,
+    forall m. (KnownNat m, 1 <= m) => SupportedPrim (bv m)
+  ) =>
+  Term Bool -> Term (bv n)
+boolToBVTerm cond =
+  let bv =
+        case cond of
+          NotTerm c -> iteTerm c (conTerm 0) (conTerm 1)
+          _ -> iteTerm cond (conTerm 1 :: Term (bv 1)) (conTerm 0) :: Term (bv 1)
+   in if natVal (Proxy @n) == 1
+        then unsafeCoerce bv
+        else bvExtendTerm True (natRepr @n) bv
+
+-- Signed BV
+instance (KnownNat w, 1 <= w) => SupportedPrimConstraint (IntN w) where
+  type PrimConstraint (IntN w) = (KnownNat w, 1 <= w, BVIsNonZero w)
+
+instance (KnownNat w, 1 <= w) => SBVRep (IntN w) where
+  type SBVType (IntN w) = SBV.SBV (SBV.IntN w)
+
+instance (KnownNat w, 1 <= w) => SupportedPrim (IntN w) where
+  sbvDistinct = withPrim @(IntN w) $ SBV.distinct . toList
+  sbvEq = withPrim @(IntN w) (SBV..==)
+  pformatCon = show
+  defaultValue = 0
+  pevalITETerm cond ifTrue ifFalse =
+    fromMaybe (iteTerm cond ifTrue ifFalse) $
+      msum
+        [ pevalITEBasic cond ifTrue ifFalse,
+          pevalITEBVTerm cond ifTrue ifFalse
+        ]
+  pevalEqTerm = pevalDefaultEqTerm
+  pevalDistinctTerm = pevalGeneralDistinct
+  conSBVTerm n = bvIsNonZeroFromGEq1 (Proxy @w) $ fromIntegral n
+  symSBVName symbol _ = show symbol
+  symSBVTerm name = bvIsNonZeroFromGEq1 (Proxy @w) $ sbvFresh name
+  withPrim r = bvIsNonZeroFromGEq1 (Proxy @w) r
+  {-# INLINE withPrim #-}
+  parseSMTModelResult _ cv =
+    withPrim @(IntN w) $
+      parseScalarSMTModelResult (\(x :: SBV.IntN w) -> fromIntegral x) cv
+  castTypedSymbol ::
+    forall knd knd'.
+    (IsSymbolKind knd') =>
+    TypedSymbol knd (IntN w) ->
+    Maybe (TypedSymbol knd' (IntN w))
+  castTypedSymbol s =
+    case decideSymbolKind @knd' of
+      Left HRefl -> Just $ typedConstantSymbol $ unTypedSymbol s
+      Right HRefl -> Just $ typedAnySymbol $ unTypedSymbol s
+  funcDummyConstraint _ = SBV.sTrue
+
+-- | Construct the 'SBV.BVIsNonZero' constraint from the proof that the width is
+-- at least 1.
+bvIsNonZeroFromGEq1 ::
+  forall w r proxy.
+  (1 <= w) =>
+  proxy w ->
+  ((SBV.BVIsNonZero w) => r) ->
+  r
+bvIsNonZeroFromGEq1 _ r1 = case unsafeAxiom :: w :~: 1 of
+  Refl -> r1
+{-# INLINE bvIsNonZeroFromGEq1 #-}
+
+instance (KnownNat w, 1 <= w) => NonFuncSBVRep (IntN w) where
+  type NonFuncSBVBaseType (IntN w) = SBV.IntN w
+
+instance (KnownNat w, 1 <= w) => SupportedNonFuncPrim (IntN w) where
+  conNonFuncSBVTerm = conSBVTerm
+  symNonFuncSBVTerm = symSBVTerm @(IntN w)
+  withNonFuncPrim r = bvIsNonZeroFromGEq1 (Proxy @w) r
+
+-- Unsigned BV
+instance (KnownNat w, 1 <= w) => SupportedPrimConstraint (WordN w) where
+  type PrimConstraint (WordN w) = (KnownNat w, 1 <= w, BVIsNonZero w)
+
+instance (KnownNat w, 1 <= w) => SBVRep (WordN w) where
+  type SBVType (WordN w) = SBV.SBV (SBV.WordN w)
+
+instance (KnownNat w, 1 <= w) => SupportedPrim (WordN w) where
+  sbvDistinct = withPrim @(WordN w) $ SBV.distinct . toList
+  sbvEq = withPrim @(WordN w) (SBV..==)
+  pformatCon = show
+  defaultValue = 0
+  pevalITETerm cond ifTrue ifFalse =
+    fromMaybe (iteTerm cond ifTrue ifFalse) $
+      msum
+        [ pevalITEBasic cond ifTrue ifFalse,
+          pevalITEBVTerm cond ifTrue ifFalse
+        ]
+  pevalEqTerm = pevalDefaultEqTerm
+  pevalDistinctTerm = pevalGeneralDistinct
+  conSBVTerm n = bvIsNonZeroFromGEq1 (Proxy @w) $ fromIntegral n
+  symSBVName symbol _ = show symbol
+  symSBVTerm name = bvIsNonZeroFromGEq1 (Proxy @w) $ sbvFresh name
+  withPrim r = bvIsNonZeroFromGEq1 (Proxy @w) r
+  {-# INLINE withPrim #-}
+  parseSMTModelResult _ cv =
+    withPrim @(WordN w) $
+      parseScalarSMTModelResult (\(x :: SBV.WordN w) -> fromIntegral x) cv
+  castTypedSymbol ::
+    forall knd knd'.
+    (IsSymbolKind knd') =>
+    TypedSymbol knd (WordN w) ->
+    Maybe (TypedSymbol knd' (WordN w))
+  castTypedSymbol s =
+    case decideSymbolKind @knd' of
+      Left HRefl -> Just $ typedConstantSymbol $ unTypedSymbol s
+      Right HRefl -> Just $ typedAnySymbol $ unTypedSymbol s
+  funcDummyConstraint _ = SBV.sTrue
+
+instance (KnownNat w, 1 <= w) => NonFuncSBVRep (WordN w) where
+  type NonFuncSBVBaseType (WordN w) = SBV.WordN w
+
+instance (KnownNat w, 1 <= w) => SupportedNonFuncPrim (WordN w) where
+  conNonFuncSBVTerm = conSBVTerm
+  symNonFuncSBVTerm = symSBVTerm @(WordN w)
+  withNonFuncPrim r = bvIsNonZeroFromGEq1 (Proxy @w) r
+
+-- FP
+instance (ValidFP eb sb) => SupportedPrimConstraint (FP eb sb) where
+  type PrimConstraint (FP eb sb) = ValidFP eb sb
+
+instance (ValidFP eb sb) => SBVRep (FP eb sb) where
+  type SBVType (FP eb sb) = SBV.SBV (SBV.FloatingPoint eb sb)
+
+instance (ValidFP eb sb) => SupportedPrim (FP eb sb) where
+  sameCon a b
+    | isNaN a = isNaN b
+    | fpIsPositiveZero a = fpIsPositiveZero b
+    | fpIsNegativeZero a = fpIsNegativeZero b
+    | otherwise = a == b
+  hashConWithSalt s a
+    | isNaN a = hashWithSalt s (2654435761 :: Int)
+    | otherwise = hashWithSalt s a
+  defaultValue = 0
+  pevalITETerm = pevalITEBasicTerm
+  pevalEqTerm (ConTerm l) (ConTerm r) = conTerm $ l == r
+  pevalEqTerm l@ConTerm {} r = pevalEqTerm r l
+  pevalEqTerm l r = eqTerm l r
+  pevalDistinctTerm (_ :| []) = conTerm True
+  pevalDistinctTerm (a :| [b]) = pevalNotTerm $ pevalEqTerm a b
+  pevalDistinctTerm l =
+    case getAllConcrete (toList l) of
+      Nothing -> distinctTerm l
+      Just xs | any isNaN xs -> distinctTerm l
+      Just xs -> conTerm $ checkConcreteDistinct xs
+  conSBVTerm (FP fp) = SBV.literal fp
+  symSBVName symbol _ = show symbol
+  symSBVTerm name = sbvFresh name
+  parseSMTModelResult _ cv =
+    withPrim @(FP eb sb) $
+      parseScalarSMTModelResult (\(x :: SBV.FloatingPoint eb sb) -> coerce x) cv
+  funcDummyConstraint _ = SBV.sTrue
+
+  -- Workaround for sbv#702.
+  sbvIte = withPrim @(FP eb sb) $ \c a b ->
+    case (SBV.unliteral a, SBV.unliteral b) of
+      (Just a', Just b')
+        | isInfinite a' && isInfinite b' ->
+            let correspondingZero x = if x > 0 then 0 else -0
+             in 1
+                  / sbvIte @(FP eb sb)
+                    c
+                    (conSBVTerm @(FP eb sb) $ correspondingZero a')
+                    (conSBVTerm @(FP eb sb) $ correspondingZero b')
+      _ -> SBV.ite c a b
+  castTypedSymbol ::
+    forall knd knd'.
+    (IsSymbolKind knd') =>
+    TypedSymbol knd (FP eb sb) ->
+    Maybe (TypedSymbol knd' (FP eb sb))
+  castTypedSymbol s =
+    case decideSymbolKind @knd' of
+      Left HRefl -> Just $ typedConstantSymbol $ unTypedSymbol s
+      Right HRefl -> Just $ typedAnySymbol $ unTypedSymbol s
+
+instance (ValidFP eb sb) => NonFuncSBVRep (FP eb sb) where
+  type NonFuncSBVBaseType (FP eb sb) = SBV.FloatingPoint eb sb
+
+instance (ValidFP eb sb) => SupportedNonFuncPrim (FP eb sb) where
+  conNonFuncSBVTerm = conSBVTerm
+  symNonFuncSBVTerm = symSBVTerm @(FP eb sb)
+  withNonFuncPrim r = r
+
+-- FPRoundingMode
+instance SupportedPrimConstraint FPRoundingMode
+
+instance SBVRep FPRoundingMode where
+  type SBVType FPRoundingMode = SBV.SBV SBV.RoundingMode
+
+instance SupportedPrim FPRoundingMode where
+  defaultValue = RNE
+  pevalITETerm = pevalITEBasicTerm
+  pevalEqTerm (ConTerm l) (ConTerm r) = conTerm $ l == r
+  pevalEqTerm l@ConTerm {} r = pevalEqTerm r l
+  pevalEqTerm l r = eqTerm l r
+  pevalDistinctTerm = pevalGeneralDistinct
+  conSBVTerm RNE = SBV.sRNE
+  conSBVTerm RNA = SBV.sRNA
+  conSBVTerm RTP = SBV.sRTP
+  conSBVTerm RTN = SBV.sRTN
+  conSBVTerm RTZ = SBV.sRTZ
+  symSBVName symbol _ = show symbol
+  symSBVTerm name = sbvFresh name
+  parseSMTModelResult _ cv =
+    withPrim @(FPRoundingMode) $
+      parseScalarSMTModelResult
+        ( \(x :: SBV.RoundingMode) -> case x of
+            SBV.RoundNearestTiesToEven -> RNE
+            SBV.RoundNearestTiesToAway -> RNA
+            SBV.RoundTowardPositive -> RTP
+            SBV.RoundTowardNegative -> RTN
+            SBV.RoundTowardZero -> RTZ
+        )
+        cv
+  castTypedSymbol ::
+    forall knd knd'.
+    (IsSymbolKind knd') =>
+    TypedSymbol knd FPRoundingMode ->
+    Maybe (TypedSymbol knd' FPRoundingMode)
+  castTypedSymbol s =
+    case decideSymbolKind @knd' of
+      Left HRefl -> Just $ typedConstantSymbol $ unTypedSymbol s
+      Right HRefl -> Just $ typedAnySymbol $ unTypedSymbol s
+  funcDummyConstraint _ = SBV.sTrue
+
+instance NonFuncSBVRep FPRoundingMode where
+  type NonFuncSBVBaseType FPRoundingMode = SBV.RoundingMode
+
+instance SupportedNonFuncPrim FPRoundingMode where
+  conNonFuncSBVTerm = conSBVTerm
+  symNonFuncSBVTerm = symSBVTerm @FPRoundingMode
+  withNonFuncPrim r = r
+
+-- AlgReal
+
+instance SupportedPrimConstraint AlgReal
+
+instance SBVRep AlgReal where
+  type SBVType AlgReal = SBV.SBV SBV.AlgReal
+
+instance SupportedPrim AlgReal where
+  defaultValue = 0
+  pevalITETerm = pevalITEBasicTerm
+  pevalEqTerm (ConTerm l) (ConTerm r) = conTerm $ l == r
+  pevalEqTerm l@ConTerm {} r = pevalEqTerm r l
+  pevalEqTerm l r = eqTerm l r
+  pevalDistinctTerm = pevalGeneralDistinct
+  conSBVTerm = SBV.literal . toSBVAlgReal
+  symSBVName symbol _ = show symbol
+  symSBVTerm name = sbvFresh name
+  parseSMTModelResult _ cv =
+    withPrim @AlgReal $
+      parseScalarSMTModelResult fromSBVAlgReal cv
+  castTypedSymbol ::
+    forall knd knd'.
+    (IsSymbolKind knd') =>
+    TypedSymbol knd AlgReal ->
+    Maybe (TypedSymbol knd' AlgReal)
+  castTypedSymbol s =
+    case decideSymbolKind @knd' of
+      Left HRefl -> Just $ typedConstantSymbol $ unTypedSymbol s
+      Right HRefl -> Just $ typedAnySymbol $ unTypedSymbol s
+  funcDummyConstraint _ = SBV.sTrue
+
+instance NonFuncSBVRep AlgReal where
+  type NonFuncSBVBaseType AlgReal = SBV.AlgReal
+
+instance SupportedNonFuncPrim AlgReal where
+  conNonFuncSBVTerm = conSBVTerm
+  symNonFuncSBVTerm = symSBVTerm @AlgReal
+  withNonFuncPrim r = r
+
+-- Bitwise
+
+bitOpOnConcat ::
+  forall bv m.
+  ( forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n),
+    PEvalBVTerm bv,
+    KnownNat m,
+    1 <= m
+  ) =>
+  ( forall n.
+    (KnownNat n, 1 <= n) =>
+    Term (bv n) -> Term (bv n) -> Term (bv n)
+  ) ->
+  Term (bv m) ->
+  Term (bv m) ->
+  Maybe (Term (bv m))
+bitOpOnConcat
+  peval
+  (BVConcatTerm (l0 :: Term (bv l)) (r0 :: Term (bv r)))
+  (BVConcatTerm (DynTerm (l :: Term (bv l))) (DynTerm (r :: Term (bv r)))) =
+    let r' = peval r0 r
+        l' = peval l0 l
+     in Just $ pevalBVConcatTerm l' r'
+bitOpOnConcat
+  peval
+  at@(ConTerm _)
+  (BVConcatTerm (l :: Term (bv l)) (r :: Term (bv r))) =
+    let nzero = natRepr @0
+        nr = natRepr @r
+        nl = natRepr @l
+        nlpr = natRepr @(l + r)
+        ar =
+          unsafePevalBVSelectTerm
+            nlpr
+            nzero
+            nr
+            (unsafeCoerce at :: Term (bv (l + r)))
+        al =
+          unsafePevalBVSelectTerm
+            nlpr
+            nr
+            nl
+            (unsafeCoerce at :: Term (bv (l + r)))
+        r' = peval ar r
+        l' = peval al l
+     in Just $ pevalBVConcatTerm l' r'
+bitOpOnConcat
+  peval
+  (BVExtendTerm True pl (l :: Term (bv n)))
+  (BVExtendTerm True _ (DynTerm (r :: Term (bv n)))) =
+    Just $ pevalBVExtendTerm True pl (peval l r)
+bitOpOnConcat _ _ _ = Nothing
+
+doPevalAndBitsTerm ::
+  forall bv m.
+  ( forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n),
+    PEvalBVTerm bv,
+    KnownNat m,
+    1 <= m
+  ) =>
+  Term (bv m) ->
+  Term (bv m) ->
+  Maybe (Term (bv m))
+doPevalAndBitsTerm (ConTerm a) (ConTerm b) =
+  Just $ conTerm (a .&. b)
+doPevalAndBitsTerm (ConTerm a) b
+  | a == zeroBits = Just $ conTerm zeroBits
+  | a == complement zeroBits = Just b
+  | aok || acok =
+      case ( mkPositiveNatRepr $ fromIntegral leadingBits,
+             mkPositiveNatRepr $ fromIntegral trailingBits
+           ) of
+        ( SomePositiveNatRepr (pleadingBits :: NatRepr leadingBits),
+          SomePositiveNatRepr (ptrailingBitsRepr :: NatRepr trailingBits)
+          ) ->
+            case ( unsafeAxiom @(leadingBits + trailingBits) @m,
+                   unsafeAxiom @(trailingBits + leadingBits) @m,
+                   unsafeLeqProof @trailingBits @m
+                 ) of
+              (Refl, Refl, LeqProof) ->
+                if aok
+                  then
+                    Just $
+                      pevalBVConcatTerm (conTerm 0 :: Term (bv leadingBits)) $
+                        pevalBVSelectTerm (natRepr @0) ptrailingBitsRepr b
+                  else
+                    Just $
+                      pevalBVConcatTerm
+                        (pevalBVSelectTerm ptrailingBitsRepr pleadingBits b)
+                        (conTerm 0 :: Term (bv trailingBits))
+  where
+    leadingBits = if aok then countLeadingZeros a else countLeadingZeros ac
+    trailingBits = fromIntegral (natVal @m a) - leadingBits
+    ac = complement a
+    aok = a .&. (a + 1) == 0
+    acok = ac .&. (ac + 1) == 0
+doPevalAndBitsTerm a b@(ConTerm _) = doPevalAndBitsTerm b a
+doPevalAndBitsTerm a b | a == b = Just a
+doPevalAndBitsTerm (ITETerm cond a@(ConTerm av) b@(ConTerm bv)) c
+  | av `elem` [0, -1] || bv `elem` [0, -1] =
+      Just $ pevalITETerm cond (pevalAndBitsTerm a c) (pevalAndBitsTerm b c)
+doPevalAndBitsTerm a (ITETerm cond b@(ConTerm bv) c@(ConTerm cv))
+  | bv `elem` [0, -1] || cv `elem` [0, -1] =
+      Just $ pevalITETerm cond (pevalAndBitsTerm a b) (pevalAndBitsTerm a c)
+doPevalAndBitsTerm (ITETerm cond a@(ConTerm v) b) c
+  | v == 0 = Just $ pevalITETerm cond a (pevalAndBitsTerm b c)
+doPevalAndBitsTerm (ITETerm cond a b@(ConTerm v)) c
+  | v == 0 = Just $ pevalITETerm cond (pevalAndBitsTerm a c) b
+doPevalAndBitsTerm a (ITETerm cond b@(ConTerm v) c)
+  | v == 0 = Just $ pevalITETerm cond b (pevalAndBitsTerm a c)
+doPevalAndBitsTerm a (ITETerm cond b c@(ConTerm v))
+  | v == 0 = Just $ pevalITETerm cond (pevalAndBitsTerm a b) c
+doPevalAndBitsTerm (BVExtendTerm True pl (ITETerm cond at@(ConTerm a) bt@(ConTerm b))) c
+  | a `elem` [0, -1] && b `elem` [0, -1] =
+      Just $
+        pevalITETerm
+          cond
+          (pevalAndBitsTerm (pevalBVExtendTerm True pl at) c)
+          (pevalAndBitsTerm (pevalBVExtendTerm True pl bt) c)
+doPevalAndBitsTerm a (BVExtendTerm True pl (ITETerm cond bt@(ConTerm b) ct@(ConTerm c)))
+  | b `elem` [0, -1] && c `elem` [0, -1] =
+      Just $
+        pevalITETerm
+          cond
+          (pevalAndBitsTerm a (pevalBVExtendTerm True pl bt))
+          (pevalAndBitsTerm a (pevalBVExtendTerm True pl ct))
+doPevalAndBitsTerm a b = bitOpOnConcat @bv @m pevalDefaultAndBitsTerm a b
+
+pevalDefaultAndBitsTerm ::
+  forall bv m.
+  ( forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n),
+    PEvalBVTerm bv,
+    KnownNat m,
+    1 <= m
+  ) =>
+  Term (bv m) ->
+  Term (bv m) ->
+  Term (bv m)
+pevalDefaultAndBitsTerm = binaryUnfoldOnce doPevalAndBitsTerm andBitsTerm
+
+doPevalOrBitsTerm ::
+  forall bv m.
+  ( forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n),
+    PEvalBVTerm bv,
+    KnownNat m,
+    1 <= m
+  ) =>
+  Term (bv m) ->
+  Term (bv m) ->
+  Maybe (Term (bv m))
+doPevalOrBitsTerm (ConTerm a) (ConTerm b) = Just $ conTerm (a .|. b)
+doPevalOrBitsTerm (ConTerm a) b
+  | a == zeroBits = Just b
+  | a == complement zeroBits = Just $ conTerm $ complement zeroBits
+  | aok || acok =
+      case ( mkPositiveNatRepr $ fromIntegral leadingBits,
+             mkPositiveNatRepr $ fromIntegral trailingBits
+           ) of
+        ( SomePositiveNatRepr (pleadingBits :: NatRepr leadingBits),
+          SomePositiveNatRepr (ptrailingBitsRepr :: NatRepr trailingBits)
+          ) ->
+            case ( unsafeAxiom @(leadingBits + trailingBits) @m,
+                   unsafeAxiom @(trailingBits + leadingBits) @m,
+                   unsafeLeqProof @trailingBits @m
+                 ) of
+              (Refl, Refl, LeqProof) ->
+                if acok
+                  then
+                    Just $
+                      pevalBVConcatTerm (conTerm $ -1 :: Term (bv leadingBits)) $
+                        pevalBVSelectTerm (natRepr @0) ptrailingBitsRepr b
+                  else
+                    Just $
+                      pevalBVConcatTerm
+                        (pevalBVSelectTerm ptrailingBitsRepr pleadingBits b)
+                        (conTerm $ -1 :: Term (bv trailingBits))
+  where
+    leadingBits = if aok then countLeadingZeros a else countLeadingZeros ac
+    trailingBits = fromIntegral (natVal @m a) - leadingBits
+    ac = complement a
+    aok = a .&. (a + 1) == 0
+    acok = ac .&. (ac + 1) == 0
+doPevalOrBitsTerm a b@(ConTerm _) = doPevalOrBitsTerm b a
+doPevalOrBitsTerm a b | a == b = Just a
+doPevalOrBitsTerm (ITETerm cond a@(ConTerm _) b@(ConTerm _)) c =
+  Just $ pevalITETerm cond (pevalOrBitsTerm a c) (pevalOrBitsTerm b c)
+doPevalOrBitsTerm a (ITETerm cond b@(ConTerm _) c@(ConTerm _)) =
+  Just $ pevalITETerm cond (pevalOrBitsTerm a b) (pevalOrBitsTerm a c)
+doPevalOrBitsTerm (ITETerm cond a@(ConTerm v) b) c
+  | v == -1 = Just $ pevalITETerm cond a (pevalOrBitsTerm b c)
+doPevalOrBitsTerm (ITETerm cond a b@(ConTerm v)) c
+  | v == -1 = Just $ pevalITETerm cond (pevalOrBitsTerm a c) b
+doPevalOrBitsTerm a (ITETerm cond b@(ConTerm v) c)
+  | v == -1 = Just $ pevalITETerm cond b (pevalOrBitsTerm a c)
+doPevalOrBitsTerm a (ITETerm cond b c@(ConTerm v))
+  | v == -1 = Just $ pevalITETerm cond (pevalOrBitsTerm a b) c
+doPevalOrBitsTerm (BVExtendTerm True pl (ITETerm cond at@(ConTerm a) bt@(ConTerm b))) c
+  | a `elem` [0, -1] && b `elem` [0, -1] =
+      Just $
+        pevalITETerm
+          cond
+          (pevalOrBitsTerm (pevalBVExtendTerm True pl at) c)
+          (pevalOrBitsTerm (pevalBVExtendTerm True pl bt) c)
+doPevalOrBitsTerm a (BVExtendTerm True pl (ITETerm cond bt@(ConTerm b) ct@(ConTerm c)))
+  | b `elem` [0, -1] && c `elem` [0, -1] =
+      Just $
+        pevalITETerm
+          cond
+          (pevalOrBitsTerm a (pevalBVExtendTerm True pl bt))
+          (pevalOrBitsTerm a (pevalBVExtendTerm True pl ct))
+doPevalOrBitsTerm a b = bitOpOnConcat @bv @m pevalDefaultOrBitsTerm a b
+
+pevalDefaultOrBitsTerm ::
+  forall bv m.
+  ( KnownNat m,
+    1 <= m,
+    forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n),
+    PEvalBVTerm bv
+  ) =>
+  Term (bv m) -> Term (bv m) -> Term (bv m)
+pevalDefaultOrBitsTerm = binaryUnfoldOnce doPevalOrBitsTerm orBitsTerm
+
+pevalDefaultXorBitsTerm ::
+  forall bv m.
+  ( forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n),
+    PEvalBVTerm bv,
+    KnownNat m,
+    1 <= m
+  ) =>
+  Term (bv m) -> Term (bv m) -> Term (bv m)
+pevalDefaultXorBitsTerm = binaryUnfoldOnce doPevalXorBitsTerm xorBitsTerm
+  where
+    doPevalXorBitsTerm (ConTerm a) (ConTerm b) =
+      Just $ conTerm (a `xor` b)
+    doPevalXorBitsTerm (ConTerm a) b
+      | a == zeroBits = Just b
+      | a == complement zeroBits = Just $ pevalComplementBitsTerm b
+    doPevalXorBitsTerm a b@(ConTerm _) = doPevalXorBitsTerm b a
+    doPevalXorBitsTerm a b | a == b = Just $ conTerm zeroBits
+    doPevalXorBitsTerm (ComplementBitsTerm i) (ComplementBitsTerm j) =
+      Just $ pevalXorBitsTerm i j
+    doPevalXorBitsTerm (ComplementBitsTerm i) j =
+      Just $ pevalComplementBitsTerm $ pevalXorBitsTerm i j
+    doPevalXorBitsTerm i (ComplementBitsTerm j) =
+      Just $ pevalComplementBitsTerm $ pevalXorBitsTerm i j
+    doPevalXorBitsTerm a b = bitOpOnConcat @bv @m pevalDefaultXorBitsTerm a b
+
+pevalDefaultComplementBitsTerm ::
+  (Bits a, SupportedPrim a, PEvalBitwiseTerm a) => Term a -> Term a
+pevalDefaultComplementBitsTerm =
+  unaryUnfoldOnce doPevalComplementBitsTerm complementBitsTerm
+  where
+    doPevalComplementBitsTerm (ConTerm a) = Just $ conTerm $ complement a
+    doPevalComplementBitsTerm (ComplementBitsTerm a) = Just a
+    doPevalComplementBitsTerm (BVConcatTerm l r) =
+      Just $
+        pevalBVConcatTerm
+          (pevalComplementBitsTerm l)
+          (pevalComplementBitsTerm r)
+    doPevalComplementBitsTerm (BVExtendTerm True pr t) =
+      Just $ pevalBVExtendTerm True pr $ pevalComplementBitsTerm t
+    doPevalComplementBitsTerm _ = Nothing
+
+instance (KnownNat n, 1 <= n) => PEvalBitwiseTerm (WordN n) where
+  pevalAndBitsTerm = pevalDefaultAndBitsTerm
+  pevalOrBitsTerm = pevalDefaultOrBitsTerm
+  pevalXorBitsTerm = pevalDefaultXorBitsTerm
+  pevalComplementBitsTerm = pevalDefaultComplementBitsTerm
+  withSbvBitwiseTermConstraint r = withPrim @(WordN n) r
+
+instance (KnownNat n, 1 <= n) => PEvalBitwiseTerm (IntN n) where
+  pevalAndBitsTerm = pevalDefaultAndBitsTerm
+  pevalOrBitsTerm = pevalDefaultOrBitsTerm
+  pevalXorBitsTerm = pevalDefaultXorBitsTerm
+  pevalComplementBitsTerm = pevalDefaultComplementBitsTerm
+  withSbvBitwiseTermConstraint r = withPrim @(IntN n) r
+
+-- BVTerm
+
+pevalDefaultBVSelectTerm ::
+  forall (bv2 :: Nat -> Type) bv n ix w p q.
+  ( KnownNat n,
+    KnownNat ix,
+    KnownNat w,
+    1 <= n,
+    1 <= w,
+    ix + w <= n,
+    PEvalBVTerm bv,
+    forall x. (KnownNat x, 1 <= x) => PEvalBitCastTerm (bv2 x) (bv x),
+    PEvalBVTerm bv2,
+    Typeable bv,
+    SupportedPrim (bv w),
+    SupportedPrim (bv2 n)
+  ) =>
+  p ix ->
+  q w ->
+  Term (bv n) ->
+  Term (bv w)
+pevalDefaultBVSelectTerm ix w =
+  unaryUnfoldOnce (doPevalDefaultBVSelectTerm @bv2 ix w) (bvSelectTerm ix w)
+
+unsafePevalBVSelectTerm ::
+  forall bv n ix w.
+  (PEvalBVTerm bv) =>
+  NatRepr n ->
+  NatRepr ix ->
+  NatRepr w ->
+  Term (bv n) ->
+  Term (bv w)
+unsafePevalBVSelectTerm n ix w term =
+  withKnownNat n $
+    withKnownNat ix $
+      withKnownNat w $
+        case ( unsafeLeqProof @1 @n,
+               unsafeLeqProof @1 @w,
+               unsafeLeqProof @(ix + w) @n
+             ) of
+          (LeqProof, LeqProof, LeqProof) -> pevalBVSelectTerm ix w term
+
+doPevalDefaultBVSelectTerm ::
+  forall (bv2 :: Nat -> Type) bv n ix w p q.
+  ( KnownNat n,
+    KnownNat ix,
+    KnownNat w,
+    forall x. (KnownNat x, 1 <= x) => PEvalBitCastTerm (bv2 x) (bv x),
+    1 <= n,
+    1 <= w,
+    ix + w <= n,
+    PEvalBVTerm bv,
+    PEvalBVTerm bv2,
+    Typeable bv,
+    SupportedPrim (bv w),
+    SupportedPrim (bv2 n)
+  ) =>
+  p ix ->
+  q w ->
+  Term (bv n) ->
+  Maybe (Term (bv w))
+doPevalDefaultBVSelectTerm _ _ rhs
+  | isJust (sameNat (Proxy @ix) (Proxy @0))
+      && isJust (sameNat (Proxy @w) (Proxy @n)) =
+      Just rhs >>= castTerm
+doPevalDefaultBVSelectTerm ix w (ConTerm b) =
+  Just $ conTerm $ sizedBVSelect ix w b
+doPevalDefaultBVSelectTerm ix w (BitCastTerm (DynTerm (b :: Term (bv2 n)))) =
+  Just $ pevalBitCastTerm $ pevalBVSelectTerm ix w b
+doPevalDefaultBVSelectTerm ix w (AddNumTerm t1 t2)
+  | natVal @ix ix == 0 =
+      Just $
+        AddNumTerm
+          (pevalDefaultBVSelectTerm @bv2 @bv ix w t1)
+          (pevalDefaultBVSelectTerm @bv2 @bv ix w t2)
+doPevalDefaultBVSelectTerm ix w (MulNumTerm t1 t2)
+  | natVal @ix ix == 0 =
+      Just $
+        MulNumTerm
+          (pevalDefaultBVSelectTerm @bv2 @bv ix w t1)
+          (pevalDefaultBVSelectTerm @bv2 @bv ix w t2)
+doPevalDefaultBVSelectTerm ix w (AndBitsTerm t1 t2) =
+  Just $
+    AndBitsTerm
+      (pevalDefaultBVSelectTerm @bv2 @bv ix w t1)
+      (pevalDefaultBVSelectTerm @bv2 @bv ix w t2)
+doPevalDefaultBVSelectTerm ix w (OrBitsTerm t1 t2) =
+  Just $
+    OrBitsTerm
+      (pevalDefaultBVSelectTerm @bv2 @bv ix w t1)
+      (pevalDefaultBVSelectTerm @bv2 @bv ix w t2)
+doPevalDefaultBVSelectTerm ix w (XorBitsTerm t1 t2) =
+  Just $
+    XorBitsTerm
+      (pevalDefaultBVSelectTerm @bv2 @bv ix w t1)
+      (pevalDefaultBVSelectTerm @bv2 @bv ix w t2)
+doPevalDefaultBVSelectTerm
+  pix
+  pw
+  (BVConcatTerm (b1 :: Term (bv n1)) (b2 :: Term (bv n2)))
+    | ix + w <= n2 = Just $ unsafePevalBVSelectTerm n2Repr ixRepr wRepr b2
+    | ix >= n2 =
+        case mkNatRepr (ix - n2) of
+          SomeNatRepr ixpn2Repr ->
+            Just $ unsafePevalBVSelectTerm n1Repr ixpn2Repr wRepr b1
+    | otherwise =
+        case (mkNatRepr (w + ix - n2), mkNatRepr (n2 - ix)) of
+          (SomeNatRepr wixpn2Repr, SomeNatRepr n2pixRepr) ->
+            let b1Part =
+                  unsafePevalBVSelectTerm n1Repr (natRepr @0) wixpn2Repr b1
+                b2Part = unsafePevalBVSelectTerm n2Repr ixRepr n2pixRepr b2
+             in Just $
+                  unsafePevalBVConcatTerm
+                    wixpn2Repr
+                    n2pixRepr
+                    wRepr
+                    b1Part
+                    b2Part
+    where
+      ixRepr = natRepr @ix
+      wRepr = natRepr @w
+      n1Repr = natRepr @n1
+      n2Repr = natRepr @n2
+      ix = natVal @ix pix
+      w = natVal @w pw
+      n2 = natVal @n2 (Proxy @n2)
+doPevalDefaultBVSelectTerm
+  _
+  _
+  (BVSelectTerm (_ :: proxy ix1) _ (b :: Term (bv n1))) =
+    Just $
+      unsafePevalBVSelectTerm
+        (natRepr @n1)
+        (addNat (natRepr @ix) (natRepr @ix1))
+        (natRepr @w)
+        b
+doPevalDefaultBVSelectTerm
+  pix
+  pw
+  (BVExtendTerm signed _ (b :: Term (bv n1)))
+    | ix + w <= n1 = Just $ unsafePevalBVSelectTerm n1Repr ixRepr wRepr b
+    | ix < n1 =
+        case mkNatRepr (n1 - ix) of
+          SomeNatRepr n1pixRepr ->
+            let bPart = unsafePevalBVSelectTerm n1Repr ixRepr n1pixRepr b
+             in Just $ unsafePevalBVExtendTerm n1pixRepr wRepr signed bPart
+    | otherwise = Nothing
+    where
+      ixRepr = natRepr @ix
+      wRepr = natRepr @w
+      n1Repr = natRepr @n1
+      ix = natVal @ix pix
+      w = natVal @w pw
+      n1 = natVal @n1 (Proxy @n1)
+doPevalDefaultBVSelectTerm _ _ _ = Nothing
+
+pevalDefaultBVExtendTerm ::
+  forall proxy l r bv.
+  ( PEvalBVTerm bv,
+    KnownNat l,
+    KnownNat r,
+    1 <= l,
+    1 <= r,
+    l <= r,
+    Typeable bv,
+    forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n)
+  ) =>
+  Bool ->
+  proxy r ->
+  Term (bv l) ->
+  Term (bv r)
+pevalDefaultBVExtendTerm signed p =
+  unaryUnfoldOnce (doPevalDefaultBVExtendTerm signed p) (bvExtendTerm signed p)
+
+unsafePevalBVExtendTerm ::
+  forall bv l r.
+  (PEvalBVTerm bv) =>
+  NatRepr l ->
+  NatRepr r ->
+  Bool ->
+  Term (bv l) ->
+  Term (bv r)
+unsafePevalBVExtendTerm lRepr rRepr signed v =
+  case (unsafeLeqProof @1 @l, unsafeLeqProof @1 @r, unsafeLeqProof @l @r) of
+    (LeqProof, LeqProof, LeqProof) ->
+      withKnownNat lRepr $
+        withKnownNat rRepr $
+          pevalBVExtendTerm signed (Proxy @r) v
+
+doPevalDefaultBVExtendTerm ::
+  forall proxy l r bv.
+  ( PEvalBVTerm bv,
+    KnownNat l,
+    KnownNat r,
+    1 <= l,
+    1 <= r,
+    l <= r,
+    Typeable bv,
+    forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n)
+  ) =>
+  Bool ->
+  proxy r ->
+  Term (bv l) ->
+  Maybe (Term (bv r))
+doPevalDefaultBVExtendTerm signed p (ConTerm b) =
+  Just $ conTerm $ if signed then sizedBVSext p b else sizedBVZext p b
+doPevalDefaultBVExtendTerm _ _ b
+  | isJust $ sameNat (Proxy @l) (Proxy @r) =
+      Just b >>= castTerm
+doPevalDefaultBVExtendTerm False pr b =
+  case (mkPositiveNatRepr $ r - l) of
+    SomePositiveNatRepr (rplRepr :: NatRepr lpr) ->
+      Just $
+        unsafePevalBVConcatTerm
+          rplRepr
+          lRepr
+          rRepr
+          (conTerm $ sizedBVFromIntegral 0)
+          b
+  where
+    lRepr = natRepr @l
+    rRepr = natRepr @r
+    l = natVal @l (Proxy @l)
+    r = natVal @r pr
+doPevalDefaultBVExtendTerm True p (BVExtendTerm True _ (b :: Term (bv l1))) =
+  case unsafeLeqProof @l1 @r of
+    LeqProof -> Just $ pevalBVExtendTerm True p b
+doPevalDefaultBVExtendTerm _ _ _ = Nothing
+
+pevalDefaultBVConcatTerm ::
+  forall bv a b.
+  ( KnownNat a,
+    KnownNat b,
+    1 <= a,
+    1 <= b,
+    PEvalBVTerm bv,
+    forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n)
+  ) =>
+  Term (bv a) ->
+  Term (bv b) ->
+  Term (bv (a + b))
+pevalDefaultBVConcatTerm =
+  withKnownNat (addNat (natRepr @a) (natRepr @b)) $
+    case (unsafeLeqProof @1 @(a + b)) of
+      LeqProof ->
+        binaryUnfoldOnce doPevalDefaultBVConcatTerm bvConcatTerm
+
+unsafeBVConcatTerm ::
+  forall bv n1 n2 r.
+  (PEvalBVTerm bv, forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n)) =>
+  NatRepr n1 ->
+  NatRepr n2 ->
+  NatRepr r ->
+  Term (bv n1) ->
+  Term (bv n2) ->
+  Term (bv r)
+unsafeBVConcatTerm n1Repr n2Repr rRepr lhs rhs =
+  case ( unsafeAxiom :: (n1 + n2) :~: r,
+         unsafeLeqProof @1 @r,
+         unsafeLeqProof @1 @n1,
+         unsafeLeqProof @1 @n2
+       ) of
+    (Refl, LeqProof, LeqProof, LeqProof) ->
+      withKnownNat n1Repr $
+        withKnownNat n2Repr $
+          withKnownNat rRepr $
+            bvConcatTerm lhs rhs
+
+unsafePevalBVConcatTerm ::
+  forall bv n1 n2 r.
+  (PEvalBVTerm bv) =>
+  NatRepr n1 ->
+  NatRepr n2 ->
+  NatRepr r ->
+  Term (bv n1) ->
+  Term (bv n2) ->
+  Term (bv r)
+unsafePevalBVConcatTerm n1Repr n2Repr rRepr lhs rhs =
+  case ( unsafeAxiom :: (n1 + n2) :~: r,
+         unsafeLeqProof @1 @r,
+         unsafeLeqProof @1 @n1,
+         unsafeLeqProof @1 @n2
+       ) of
+    (Refl, LeqProof, LeqProof, LeqProof) ->
+      withKnownNat n1Repr $
+        withKnownNat n2Repr $
+          withKnownNat rRepr $
+            pevalBVConcatTerm lhs rhs
+
+doPevalDefaultBVConcatTerm ::
+  forall bv l r.
+  ( KnownNat l,
+    KnownNat r,
+    KnownNat (l + r),
+    1 <= l,
+    1 <= r,
+    1 <= (l + r),
+    PEvalBVTerm bv,
+    forall n. (KnownNat n, 1 <= n) => SupportedPrim (bv n)
+  ) =>
+  Term (bv l) ->
+  Term (bv r) ->
+  Maybe (Term (bv (l + r)))
+-- 1. [c1 c2] -> c1c2
+doPevalDefaultBVConcatTerm (ConTerm v) (ConTerm v') =
+  withKnownNat (addNat (natRepr @l) (natRepr @r)) $
+    Just $
+      conTerm $
+        sizedBVConcat v v'
+-- 2. [c1 (c2 ?)] -> (c1c2 ?)
+doPevalDefaultBVConcatTerm
+  (ConTerm vl)
+  (BVConcatTerm (ConTerm (vrl :: bv rl)) (rr :: Term (bv rr))) =
+    case unsafeLeqProof @1 @(l + rl) of
+      LeqProof ->
+        Just $
+          withKnownNat lRlRepr $
+            unsafeBVConcatTerm
+              lRlRepr
+              (natRepr @rr)
+              (addNat (natRepr @l) (natRepr @r))
+              (conTerm $ sizedBVConcat vl vrl)
+              rr
+    where
+      lRlRepr = addNat (natRepr @l) (natRepr @rl)
+-- 3. [c1 (s c2)] -> (c1 (s c2))
+doPevalDefaultBVConcatTerm (ConTerm {}) (BVConcatTerm _ ConTerm {}) = Nothing
+-- 4. [(c s) ?) -> (c [s ?])
+doPevalDefaultBVConcatTerm
+  (BVConcatTerm (ll@ConTerm {} :: Term (bv ll)) (lr :: Term (bv lr)))
+  r =
+    Just $ unsafeBVConcatTerm llRepr lrRRepr lRRepr ll rhs
+    where
+      llRepr = natRepr @ll
+      lrRepr = natRepr @lr
+      lRepr = natRepr @l
+      rRepr = natRepr @r
+      lrRRepr = addNat lrRepr rRepr
+      lRRepr = addNat lRepr rRepr
+      rhs :: Term (bv (lr + r))
+      rhs = unsafePevalBVConcatTerm lrRepr rRepr lrRRepr lr r
+-- 5. [? (c1 (s2 c2))] -> (([? c1] s2) c2)
+doPevalDefaultBVConcatTerm
+  l
+  ( BVConcatTerm
+      (rl@ConTerm {} :: Term (bv rl))
+      (BVConcatTerm (rrl :: Term (bv rrl)) (rrr@ConTerm {} :: Term (bv rrr)))
+    ) =
+    Just $ unsafeBVConcatTerm lRlRrlRepr rrrRepr lRRepr lRlRrl rrr
+    where
+      lRepr = natRepr @l
+      rlRepr = natRepr @rl
+      rrlRepr = natRepr @rrl
+      rrrRepr = natRepr @rrr
+      lRlRepr = addNat lRepr rlRepr
+      rRepr = natRepr @r
+      lRRepr = addNat lRepr rRepr
+      lRl = unsafePevalBVConcatTerm lRepr rlRepr lRlRepr l rl
+      lRlRrlRepr = addNat lRlRepr rrlRepr
+      lRlRrl = unsafeBVConcatTerm lRlRepr rrlRepr lRlRrlRepr lRl rrl
+-- 6. [(s1 c1) c2] -> (s1 c1c2)
+doPevalDefaultBVConcatTerm
+  (BVConcatTerm (ll :: Term (bv ll)) ((ConTerm vlr) :: Term (bv lr)))
+  (ConTerm vr) =
+    Just $ unsafeBVConcatTerm llRepr lrRRepr lRRepr ll rhs
+    where
+      llRepr = natRepr @ll
+      lrRepr = natRepr @lr
+      lRepr = natRepr @l
+      rRepr = natRepr @r
+      lrRRepr = addNat lrRepr rRepr
+      lRRepr = addNat lRepr rRepr
+      rhs :: Term (bv (lr + r))
+      rhs = case unsafeLeqProof @1 @(lr + r) of
+        LeqProof ->
+          withKnownNat lrRRepr $ conTerm $ sizedBVConcat vlr vr
+-- 7. [(s1 c1) (c2 s2)] -> (s1 (c1c2 s2))
+doPevalDefaultBVConcatTerm
+  (BVConcatTerm (ll :: Term (bv ll)) ((ConTerm vlr) :: Term (bv lr)))
+  (BVConcatTerm ((ConTerm vrl) :: Term (bv rl)) (rr :: Term (bv rr))) =
+    Just $ unsafeBVConcatTerm llRepr lrRlRrRepr lRRepr ll lrRlRR
+    where
+      lRepr = natRepr @l
+      rRepr = natRepr @r
+      llRepr = natRepr @ll
+      lrRepr = natRepr @lr
+      rlRepr = natRepr @rl
+      rrRepr = natRepr @rr
+      lRRepr = addNat lRepr rRepr
+      lrRlRepr :: NatRepr (lr + rl)
+      lrRlRepr = addNat lrRepr rlRepr
+      lrRlRrRepr :: NatRepr ((lr + rl) + rr)
+      lrRlRrRepr = addNat lrRlRepr rrRepr
+      lrRl :: Term (bv (lr + rl))
+      lrRl = case unsafeLeqProof @1 @(lr + rl) of
+        LeqProof -> withKnownNat lrRlRepr $ conTerm $ sizedBVConcat vlr vrl
+      lrRlRR :: Term (bv ((lr + rl) + rr))
+      lrRlRR = unsafeBVConcatTerm lrRlRepr rrRepr lrRlRrRepr lrRl rr
+-- 8. [?notc (s2 c)] -> ((s1 s2) c)
+doPevalDefaultBVConcatTerm
+  l
+  (BVConcatTerm (rl :: Term (bv rl)) (rr@ConTerm {} :: Term (bv rr))) =
+    Just $
+      unsafeBVConcatTerm
+        lRlRepr
+        (natRepr @rr)
+        (addNat (natRepr @l) (natRepr @r))
+        lhs
+        rr
+    where
+      lRepr = natRepr @l
+      rlRepr = natRepr @rl
+      lRlRepr = addNat lRepr rlRepr
+      lhs :: Term (bv (l + rl))
+      lhs = unsafeBVConcatTerm lRepr rlRepr lRlRepr l rl
+doPevalDefaultBVConcatTerm
+  (BVSelectTerm ix0 (_ :: p w0) (bv0 :: Term (bv n)))
+  (BVSelectTerm (ix1 :: p ix1) (w1 :: p w1) (DynTerm (bv1 :: Term (bv n))))
+    | ix1v + w1v == ix0v && bv0 == bv1 =
+        Just $ unsafePevalBVSelectTerm nRepr ix1Repr (addNat w0Repr w1Repr) bv0
+    where
+      nRepr = natRepr @n
+      w1v = natVal w1
+      ix0v = natVal ix0
+      ix1v = natVal ix1
+      ix1Repr = natRepr @ix1
+      w0Repr = natRepr @w0
+      w1Repr = natRepr @w1
+doPevalDefaultBVConcatTerm _ _ = Nothing
+
+instance PEvalBVTerm WordN where
+  pevalBVSelectTerm = pevalDefaultBVSelectTerm @IntN
+  pevalBVConcatTerm = pevalDefaultBVConcatTerm
+  pevalBVExtendTerm = pevalDefaultBVExtendTerm
+  sbvBVConcatTerm pl pr l r =
+    bvIsNonZeroFromGEq1 pl $
+      bvIsNonZeroFromGEq1 pr $
+        l SBV.# r
+  sbvBVSelectTerm (pix :: p0 ix) (pw :: p1 w) (pn :: p2 n) bv =
+    bvIsNonZeroFromGEq1 (Proxy @n) $
+      bvIsNonZeroFromGEq1 (Proxy @w) $
+        sbvDefaultBVSelectTerm pix pw pn bv
+  sbvBVExtendTerm (_ :: p0 l) (_ :: p1 r) signed bv =
+    withKnownProof
+      (unsafeKnownProof @(r - l) (natVal (Proxy @r) - natVal (Proxy @l)))
+      $ case (unsafeLeqProof @(l + 1) @r, unsafeLeqProof @1 @(r - l)) of
+        (LeqProof, LeqProof) ->
+          bvIsNonZeroFromGEq1 (Proxy @r) $
+            bvIsNonZeroFromGEq1 (Proxy @l) $
+              bvIsNonZeroFromGEq1 (Proxy @(r - l)) $
+                if signed then SBV.signExtend bv else SBV.zeroExtend bv
+
+instance PEvalBVTerm IntN where
+  pevalBVSelectTerm = pevalDefaultBVSelectTerm @WordN
+  pevalBVConcatTerm = pevalDefaultBVConcatTerm
+  pevalBVExtendTerm = pevalDefaultBVExtendTerm
+  sbvBVConcatTerm (pl :: p l) (pr :: q r) l r =
+    bvIsNonZeroFromGEq1 pl $
+      bvIsNonZeroFromGEq1 pr $
+        withKnownNat (addNat (natRepr @l) (natRepr @r)) $
+          case unsafeLeqProof @1 @(l + r) of
+            LeqProof ->
+              bvIsNonZeroFromGEq1 (Proxy @(l + r)) $
+                sbvBitCast @(WordN (l + r)) @(IntN (l + r)) $
+                  (sbvBitCast @(IntN l) @(WordN l) l)
+                    SBV.# (sbvBitCast @(IntN r) @(WordN r) r)
+  sbvBVSelectTerm (pix :: p0 ix) (pw :: p1 w) (pn :: p2 n) bv =
+    bvIsNonZeroFromGEq1 (Proxy @n) $
+      bvIsNonZeroFromGEq1 (Proxy @w) $
+        sbvDefaultBVSelectTerm pix pw pn bv
+  sbvBVExtendTerm (_ :: p0 l) (_ :: p1 r) signed bv =
+    withKnownProof
+      (unsafeKnownProof @(r - l) (natVal (Proxy @r) - natVal (Proxy @l)))
+      $ case (unsafeLeqProof @(l + 1) @r, unsafeLeqProof @1 @(r - l)) of
+        (LeqProof, LeqProof) ->
+          bvIsNonZeroFromGEq1 (Proxy @r) $
+            bvIsNonZeroFromGEq1 (Proxy @l) $
+              bvIsNonZeroFromGEq1 (Proxy @(r - l)) $
+                if signed
+                  then SBV.signExtend bv
+                  else
+                    SBV.sFromIntegral
+                      ( SBV.zeroExtend
+                          (SBV.sFromIntegral bv :: SBV.SBV (SBV.WordN l)) ::
+                          SBV.SBV (SBV.WordN r)
+                      )
+
+sbvDefaultBVSelectTerm ::
+  ( KnownNat ix,
+    KnownNat w,
+    KnownNat n,
+    1 <= n,
+    1 <= w,
+    (ix + w) <= n,
+    SBV.SymVal (bv n)
+  ) =>
+  p1 ix ->
+  p2 w ->
+  p3 n ->
+  SBV.SBV (bv n) ->
+  SBV.SBV (bv w)
+sbvDefaultBVSelectTerm (_ :: p0 ix) (_ :: p1 w) (_ :: p2 n) bv =
+  withKnownProof
+    ( unsafeKnownProof @(w + ix - 1)
+        (natVal (Proxy @w) + natVal (Proxy @ix) - 1)
+    )
+    $ case ( unsafeAxiom @(w + ix - 1 - ix + 1) @w,
+             unsafeLeqProof @(((w + ix) - 1) + 1) @n,
+             unsafeLeqProof @ix @(w + ix - 1)
+           ) of
+      (Refl, LeqProof, LeqProof) ->
+        bvIsNonZeroFromGEq1 (Proxy @n) $
+          bvIsNonZeroFromGEq1 (Proxy @w) $
+            SBV.bvExtract (Proxy @(w + ix - 1)) (Proxy @ix) bv
+
+doPevalBitCastSameType ::
+  forall x b. (SupportedPrim b) => Term x -> Maybe (Term b)
+doPevalBitCastSameType (BitCastTerm (DynTerm (b :: Term b))) = Just b
+doPevalBitCastSameType (BitCastTerm x) = doPevalBitCastSameType x
+doPevalBitCastSameType _ = Nothing
+
+-- | Partially evaluate a bitcast term. If no reduction is performed, return
+-- Nothing.
+doPevalBitCast :: (PEvalBitCastTerm a b, SupportedPrim b) => Term a -> Maybe (Term b)
+doPevalBitCast (ConTerm v) = Just $ conTerm $ bitCast v
+doPevalBitCast t = doPevalBitCastSameType t
+
+instance (KnownNat n, 1 <= n) => PEvalBitCastTerm (WordN n) (IntN n) where
+  pevalBitCastTerm = unaryUnfoldOnce doPevalBitCastBV bitCastTerm
+    where
+      doPevalBitCastBV :: Term (WordN n) -> Maybe (Term (IntN n))
+      doPevalBitCastBV
+        (BVConcatTerm (l :: Term (WordN l)) (r :: Term (WordN r))) =
+          Just $
+            pevalBVConcatTerm
+              (pevalBitCastTerm @(WordN l) @(IntN l) l)
+              (pevalBitCastTerm @(WordN r) @(IntN r) r)
+      doPevalBitCastBV (BVExtendTerm signed pr (b :: Term (WordN l))) =
+        Just $
+          pevalBVExtendTerm signed pr $
+            pevalBitCastTerm @(WordN l) @(IntN l) b
+      doPevalBitCastBV v = doPevalBitCast v
+  sbvBitCast = bvIsNonZeroFromGEq1 (Proxy @n) SBV.sFromIntegral
+
+instance (KnownNat n, 1 <= n) => PEvalBitCastTerm (IntN n) (WordN n) where
+  pevalBitCastTerm = unaryUnfoldOnce doPevalBitCastBV bitCastTerm
+    where
+      doPevalBitCastBV :: Term (IntN n) -> Maybe (Term (WordN n))
+      doPevalBitCastBV
+        (BVConcatTerm (l :: Term (IntN l)) (r :: Term (IntN r))) =
+          Just $
+            pevalBVConcatTerm
+              (pevalBitCastTerm @(IntN l) @(WordN l) l)
+              (pevalBitCastTerm @(IntN r) @(WordN r) r)
+      doPevalBitCastBV (BVExtendTerm signed pr (b :: Term (IntN l))) =
+        Just $
+          pevalBVExtendTerm signed pr $
+            pevalBitCastTerm @(IntN l) @(WordN l) b
+      doPevalBitCastBV v = doPevalBitCast v
+  sbvBitCast = bvIsNonZeroFromGEq1 (Proxy @n) SBV.sFromIntegral
+
+-- Num
+
+-- | Default partial evaluation of addition of numerical terms.
+pevalDefaultAddNumTerm :: (PEvalNumTerm a, Eq a) => Term a -> Term a -> Term a
+pevalDefaultAddNumTerm l@SupportedTerm r =
+  binaryUnfoldOnce
+    doPevalDefaultAddNumTerm
+    (\a b -> normalizeAddNum $ addNumTerm a b)
+    l
+    r
+
+doPevalDefaultAddNumTerm ::
+  (PEvalNumTerm a, Eq a) => Term a -> Term a -> Maybe (Term a)
+doPevalDefaultAddNumTerm (ConTerm a) (ConTerm b) = Just $ conTerm $ a + b
+doPevalDefaultAddNumTerm l@(ConTerm a) b = case (a, b) of
+  (0, k) -> Just k
+  (l1, AddNumTerm (ConTerm j) k) ->
+    Just $ pevalAddNumTerm (conTerm $ l1 + j) k
+  _ -> doPevalDefaultAddNumTermNoCon l b
+doPevalDefaultAddNumTerm a r@(ConTerm {}) = doPevalDefaultAddNumTerm r a
+doPevalDefaultAddNumTerm l r = doPevalDefaultAddNumTermNoCon l r
+
+doPevalDefaultAddNumTermNoCon ::
+  (PEvalNumTerm a) => Term a -> Term a -> Maybe (Term a)
+doPevalDefaultAddNumTermNoCon (AddNumTerm i@ConTerm {} j) k =
+  Just $ pevalAddNumTerm i $ pevalAddNumTerm j k
+doPevalDefaultAddNumTermNoCon i (AddNumTerm j@ConTerm {} k) =
+  Just $ pevalAddNumTerm j $ pevalAddNumTerm i k
+doPevalDefaultAddNumTermNoCon (NegNumTerm i) (NegNumTerm j) =
+  Just $ pevalNegNumTerm $ pevalAddNumTerm i j
+doPevalDefaultAddNumTermNoCon
+  (MulNumTerm (ConTerm i) j)
+  (MulNumTerm (ConTerm k) l)
+    | j == l = Just $ pevalMulNumTerm (conTerm $ i + k) j
+doPevalDefaultAddNumTermNoCon
+  (MulNumTerm i@ConTerm {} j)
+  (MulNumTerm k@(ConTerm {}) l)
+    | i == k = Just $ pevalMulNumTerm i (pevalAddNumTerm j l)
+doPevalDefaultAddNumTermNoCon _ _ = Nothing
+
+normalizeAddNum :: (PEvalNumTerm a) => Term a -> Term a
+normalizeAddNum (AddNumTerm l r@(ConTerm {})) = addNumTerm r l
+normalizeAddNum v = v
+
+-- | Default partial evaluation of negation of numerical terms.
+pevalDefaultNegNumTerm :: (PEvalNumTerm a, Eq a) => Term a -> Term a
+pevalDefaultNegNumTerm l@SupportedTerm =
+  unaryUnfoldOnce doPevalDefaultNegNumTerm negNumTerm l
+
+doPevalDefaultNegNumTerm :: (PEvalNumTerm a) => Term a -> Maybe (Term a)
+doPevalDefaultNegNumTerm (ConTerm a) = Just $ conTerm $ -a
+doPevalDefaultNegNumTerm (NegNumTerm v) = Just v
+doPevalDefaultNegNumTerm (AddNumTerm (ConTerm l) r) =
+  Just $ pevalSubNumTerm (conTerm $ -l) r
+doPevalDefaultNegNumTerm (AddNumTerm (NegNumTerm l) r) =
+  Just $ pevalAddNumTerm l (pevalNegNumTerm r)
+doPevalDefaultNegNumTerm (AddNumTerm l (NegNumTerm r)) =
+  Just $ pevalAddNumTerm (pevalNegNumTerm l) r
+doPevalDefaultNegNumTerm (MulNumTerm (ConTerm l) r) =
+  Just $ pevalMulNumTerm (conTerm $ -l) r
+doPevalDefaultNegNumTerm (MulNumTerm (NegNumTerm {}) _) =
+  error "Should not happen"
+doPevalDefaultNegNumTerm (MulNumTerm _ (NegNumTerm {})) =
+  error "Should not happen"
+doPevalDefaultNegNumTerm (AddNumTerm _ ConTerm {}) = error "Should not happen"
+doPevalDefaultNegNumTerm _ = Nothing
+
+-- Mul
+pevalDefaultMulNumTerm :: (PEvalNumTerm a, Eq a) => Term a -> Term a -> Term a
+pevalDefaultMulNumTerm l@SupportedTerm r =
+  binaryUnfoldOnce
+    doPevalDefaultMulNumTerm
+    (\a b -> normalizeMulNum $ mulNumTerm a b)
+    l
+    r
+
+normalizeMulNum :: (PEvalNumTerm a) => Term a -> Term a
+normalizeMulNum (MulNumTerm l r@(ConTerm {})) = mulNumTerm r l
+normalizeMulNum v = v
+
+doPevalDefaultMulNumTerm ::
+  (PEvalNumTerm a, Eq a) => Term a -> Term a -> Maybe (Term a)
+doPevalDefaultMulNumTerm (ConTerm a) (ConTerm b) =
+  Just $ conTerm $ a * b
+doPevalDefaultMulNumTerm l@(ConTerm a) b = case (a, b) of
+  (0, _) -> Just $ conTerm 0
+  (1, k) -> Just k
+  (-1, k) -> Just $ pevalNegNumTerm k
+  (l1, MulNumTerm (ConTerm j) k) ->
+    Just $ pevalMulNumTerm (conTerm $ l1 * j) k
+  (l1, AddNumTerm (ConTerm j) k) ->
+    Just $ pevalAddNumTerm (conTerm $ l1 * j) (pevalMulNumTerm (conTerm l1) k)
+  (l1, NegNumTerm j) -> Just (pevalMulNumTerm (conTerm $ -l1) j)
+  (_, MulNumTerm _ ConTerm {}) -> error "Should not happen"
+  (_, AddNumTerm _ ConTerm {}) -> error "Should not happen"
+  _ -> doPevalDefaultMulNumTermNoCon l b
+doPevalDefaultMulNumTerm a r@(ConTerm {}) = doPevalDefaultMulNumTerm r a
+doPevalDefaultMulNumTerm l r = doPevalDefaultMulNumTermNoCon l r
+
+doPevalDefaultMulNumTermNoCon ::
+  (PEvalNumTerm a) => Term a -> Term a -> Maybe (Term a)
+doPevalDefaultMulNumTermNoCon (MulNumTerm i@ConTerm {} j) k =
+  Just $ pevalMulNumTerm i $ pevalMulNumTerm j k
+doPevalDefaultMulNumTermNoCon i (MulNumTerm j@ConTerm {} k) =
+  Just $ pevalMulNumTerm j $ pevalMulNumTerm i k
+doPevalDefaultMulNumTermNoCon (NegNumTerm i) j =
+  Just $ pevalNegNumTerm $ pevalMulNumTerm i j
+doPevalDefaultMulNumTermNoCon i (NegNumTerm j) =
+  Just $ pevalNegNumTerm $ pevalMulNumTerm i j
+doPevalDefaultMulNumTermNoCon i j@ConTerm {} = Just $ pevalMulNumTerm j i
+doPevalDefaultMulNumTermNoCon (MulNumTerm _ ConTerm {}) _ =
+  error "Should not happen"
+doPevalDefaultMulNumTermNoCon _ (MulNumTerm _ ConTerm {}) =
+  error "Should not happen"
+doPevalDefaultMulNumTermNoCon _ _ = Nothing
+
+-- Abs
+pevalBitsAbsNumTerm :: (PEvalNumTerm a, Bits a) => Term a -> Term a
+pevalBitsAbsNumTerm l@SupportedTerm =
+  unaryUnfoldOnce doPevalBitsAbsNumTerm absNumTerm l
+
+doPevalGeneralAbsNumTerm :: (PEvalNumTerm a) => Term a -> Maybe (Term a)
+doPevalGeneralAbsNumTerm (ConTerm a) = Just $ conTerm $ abs a
+doPevalGeneralAbsNumTerm (NegNumTerm v) = Just $ pevalAbsNumTerm v
+doPevalGeneralAbsNumTerm t@(AbsNumTerm {}) = Just t
+doPevalGeneralAbsNumTerm _ = Nothing
+
+doPevalBitsAbsNumTerm ::
+  forall a. (PEvalNumTerm a, Bits a) => Term a -> Maybe (Term a)
+doPevalBitsAbsNumTerm t =
+  msum
+    [ if isSigned (undefined :: a) then Nothing else Just t,
+      doPevalGeneralAbsNumTerm t
+    ]
+
+doPevalNoOverflowAbsNumTerm :: (PEvalNumTerm a) => Term a -> Maybe (Term a)
+doPevalNoOverflowAbsNumTerm t =
+  msum
+    [ doPevalGeneralAbsNumTerm t,
+      case t of
+        MulNumTerm l r ->
+          Just $ pevalMulNumTerm (pevalAbsNumTerm l) $ pevalAbsNumTerm r
+        _ -> Nothing
+    ]
+
+-- Signum
+
+pevalGeneralSignumNumTerm :: (PEvalNumTerm a) => Term a -> Term a
+pevalGeneralSignumNumTerm l@SupportedTerm =
+  unaryUnfoldOnce doPevalGeneralSignumNumTerm signumNumTerm l
+
+doPevalGeneralSignumNumTerm :: (PEvalNumTerm a) => Term a -> Maybe (Term a)
+doPevalGeneralSignumNumTerm (ConTerm a) = Just $ conTerm $ signum a
+doPevalGeneralSignumNumTerm _ = Nothing
+
+doPevalNoOverflowSignumNumTerm :: (PEvalNumTerm a) => Term a -> Maybe (Term a)
+doPevalNoOverflowSignumNumTerm t =
+  msum
+    [ doPevalGeneralSignumNumTerm t,
+      case t of
+        NegNumTerm v -> Just $ pevalNegNumTerm $ pevalSignumNumTerm v
+        MulNumTerm l r ->
+          Just $
+            pevalMulNumTerm (pevalSignumNumTerm l) $
+              pevalSignumNumTerm r
+        _ -> Nothing
+    ]
+
+instance (KnownNat n, 1 <= n) => PEvalNumTerm (WordN n) where
+  pevalAddNumTerm = pevalDefaultAddNumTerm
+  pevalNegNumTerm = pevalDefaultNegNumTerm
+  pevalMulNumTerm = pevalDefaultMulNumTerm
+  pevalAbsNumTerm = pevalBitsAbsNumTerm
+  pevalSignumNumTerm = pevalGeneralSignumNumTerm
+  withSbvNumTermConstraint r = withPrim @(WordN n) r
+
+instance (KnownNat n, 1 <= n) => PEvalNumTerm (IntN n) where
+  pevalAddNumTerm = pevalDefaultAddNumTerm
+  pevalNegNumTerm = pevalDefaultNegNumTerm
+  pevalMulNumTerm = pevalDefaultMulNumTerm
+  pevalAbsNumTerm = pevalBitsAbsNumTerm
+  pevalSignumNumTerm = pevalGeneralSignumNumTerm
+  withSbvNumTermConstraint r = withPrim @(IntN n) r
+
+-- Partial evaluation
+
+-- | A partial function from a to b.
+type PartialFun a b = a -> Maybe b
+
+-- | A partial rule for unary operations.
+type PartialRuleUnary a b = PartialFun (Term a) (Term b)
+
+-- | A total rule for unary operations.
+type TotalRuleUnary a b = Term a -> Term b
+
+-- | A partial rule for binary operations.
+type PartialRuleBinary a b c = Term a -> PartialFun (Term b) (Term c)
+
+-- | A total rule for binary operations.
+type TotalRuleBinary a b c = Term a -> Term b -> Term c
+
+-- | Totalize a partial function with a fallback function.
+totalize :: PartialFun a b -> (a -> b) -> a -> b
+totalize partial fallback a =
+  case partial a of
+    Just b -> b
+    Nothing -> fallback a
+
+-- | Totalize a binary partial function with a fallback function.
+totalize2 :: (a -> PartialFun b c) -> (a -> b -> c) -> a -> b -> c
+totalize2 partial fallback a b =
+  case partial a b of
+    Just c -> c
+    Nothing -> fallback a b
+
+-- | A strategy for partially evaluating unary operations.
+class UnaryPartialStrategy tag a b | tag a -> b where
+  extractor :: tag -> Term a -> Maybe a
+  constantHandler :: tag -> a -> Maybe (Term b)
+  nonConstantHandler :: tag -> Term a -> Maybe (Term b)
+
+-- | Partially evaluate a unary operation.
+unaryPartial :: forall tag a b. (UnaryPartialStrategy tag a b) => tag -> PartialRuleUnary a b
+unaryPartial tag a = case extractor tag a of
+  Nothing -> nonConstantHandler tag a
+  Just a' -> constantHandler tag a'
+
+-- | A strategy for partially evaluating commutative binary operations.
+class BinaryCommPartialStrategy tag a c | tag a -> c where
+  singleConstantHandler :: tag -> a -> Term a -> Maybe (Term c)
+
+-- | A strategy for partially evaluating operations.
+class BinaryPartialStrategy tag a b c | tag a b -> c where
+  extractora :: tag -> Term a -> Maybe a
+  extractorb :: tag -> Term b -> Maybe b
+  allConstantHandler :: tag -> a -> b -> Maybe (Term c)
+  leftConstantHandler :: tag -> a -> Term b -> Maybe (Term c)
+  default leftConstantHandler :: (a ~ b, BinaryCommPartialStrategy tag a c) => tag -> a -> Term b -> Maybe (Term c)
+  leftConstantHandler = singleConstantHandler @tag @a
+  rightConstantHandler :: tag -> Term a -> b -> Maybe (Term c)
+  default rightConstantHandler :: (a ~ b, BinaryCommPartialStrategy tag a c) => tag -> Term a -> b -> Maybe (Term c)
+  rightConstantHandler tag = flip $ singleConstantHandler @tag @a tag
+  nonBinaryConstantHandler :: tag -> Term a -> Term b -> Maybe (Term c)
+
+-- | Partially evaluate a binary operation.
+binaryPartial :: forall tag a b c. (BinaryPartialStrategy tag a b c) => tag -> PartialRuleBinary a b c
+binaryPartial tag a b = case (extractora @tag @a @b @c tag a, extractorb @tag @a @b @c tag b) of
+  (Nothing, Nothing) -> nonBinaryConstantHandler @tag @a @b @c tag a b
+  (Just a', Nothing) ->
+    leftConstantHandler @tag @a @b @c tag a' b
+      `catchError` \_ -> nonBinaryConstantHandler @tag @a @b @c tag a b
+  (Nothing, Just b') ->
+    rightConstantHandler @tag @a @b @c tag a b'
+      `catchError` \_ -> nonBinaryConstantHandler @tag @a @b @c tag a b
+  (Just a', Just b') ->
+    allConstantHandler @tag @a @b @c tag a' b'
+
+unaryPartialUnfoldOnce ::
+  forall a b.
+  (SupportedPrim b) =>
+  PartialRuleUnary a b ->
+  TotalRuleUnary a b ->
+  PartialRuleUnary a b
+unaryPartialUnfoldOnce partial fallback = ret
+  where
+    oneLevel :: TotalRuleUnary a b -> PartialRuleUnary a b
+    oneLevel fallback' x = case (x, partial x) of
+      (ITETerm cond vt vf, pr) ->
+        let pt = partial vt
+            pf = partial vf
+         in case (pt, pf) of
+              (Nothing, Nothing) -> pr
+              (mt, mf) ->
+                pevalITETerm cond
+                  <$> catchError mt (\_ -> Just $ totalize (oneLevel fallback') fallback' vt)
+                  <*> catchError mf (\_ -> Just $ totalize (oneLevel fallback') fallback vf)
+      (_, pr) -> pr
+    ret :: PartialRuleUnary a b
+    ret = oneLevel (totalize @(Term a) @(Term b) partial fallback)
+
+-- | Unfold a unary operation once.
+unaryUnfoldOnce ::
+  forall a b.
+  (SupportedPrim b) =>
+  PartialRuleUnary a b ->
+  TotalRuleUnary a b ->
+  TotalRuleUnary a b
+unaryUnfoldOnce partial fallback = totalize (unaryPartialUnfoldOnce partial fallback) fallback
+
+binaryPartialUnfoldOnce ::
+  forall a b c.
+  (SupportedPrim c) =>
+  PartialRuleBinary a b c ->
+  TotalRuleBinary a b c ->
+  PartialRuleBinary a b c
+binaryPartialUnfoldOnce partial fallback = ret
+  where
+    oneLevel :: PartialRuleBinary x y c -> TotalRuleBinary x y c -> PartialRuleBinary x y c
+    oneLevel partial' fallback' x y =
+      catchError
+        (partial' x y)
+        ( \_ ->
+            case (x, y) of
+              (ITETerm _ ITETerm {} _, ITETerm {}) -> Nothing
+              (ITETerm _ _ ITETerm {}, ITETerm {}) -> Nothing
+              (ITETerm {}, ITETerm _ ITETerm {} _) -> Nothing
+              (ITETerm {}, ITETerm _ _ ITETerm {}) -> Nothing
+              (ITETerm cond vt vf, _) ->
+                left cond vt vf y partial' fallback'
+              (_, ITETerm cond vt vf) ->
+                left cond vt vf x (flip partial') (flip fallback')
+              _ -> Nothing
+        )
+    left ::
+      Term Bool ->
+      Term x ->
+      Term x ->
+      Term y ->
+      PartialRuleBinary x y c ->
+      TotalRuleBinary x y c ->
+      Maybe (Term c)
+    left cond vt vf y partial' fallback' =
+      let pt = partial' vt y
+          pf = partial' vf y
+       in case (pt, pf) of
+            (Nothing, Nothing) -> Nothing
+            (mt, mf) ->
+              pevalITETerm cond
+                <$> catchError mt (\_ -> Just $ totalize2 (oneLevel partial' fallback') fallback' vt y)
+                <*> catchError mf (\_ -> Just $ totalize2 (oneLevel partial' fallback') fallback' vf y)
+    ret :: PartialRuleBinary a b c
+    ret = oneLevel partial (totalize2 @(Term a) @(Term b) @(Term c) partial fallback)
+
+-- | Unfold a binary operation once.
+binaryUnfoldOnce ::
+  forall a b c.
+  (SupportedPrim c) =>
+  PartialRuleBinary a b c ->
+  TotalRuleBinary a b c ->
+  TotalRuleBinary a b c
+binaryUnfoldOnce partial fallback = totalize2 (binaryPartialUnfoldOnce partial fallback) fallback
+
+-- | Unfold a unary operation once.
+generalUnaryUnfolded ::
+  forall a b.
+  (Typeable a, SupportedPrim b) =>
+  (a -> b) ->
+  (Term a -> Term b) ->
+  Term a ->
+  Term b
+generalUnaryUnfolded compute =
+  unaryUnfoldOnce
+    ( \case
+        ConTerm lv -> Just $ conTerm $ compute lv
+        _ -> Nothing
+    )
+
+-- | Unfold a binary operation once.
+generalBinaryUnfolded ::
+  forall a b c.
+  (Typeable a, Typeable b, SupportedPrim c) =>
+  (a -> b -> c) ->
+  (Term a -> Term b -> Term c) ->
+  Term a ->
+  Term b ->
+  Term c
+generalBinaryUnfolded compute =
+  binaryUnfoldOnce
+    ( \l r -> case (l, r) of
+        (ConTerm lv, ConTerm rv) -> Just $ conTerm $ compute lv rv
+        _ -> Nothing
+    )

@@ -135,7 +135,7 @@ symPopCount ::
   a
 symPopCount a =
   withMode @mode
-    (withBaseFiniteBits @mode @a (fromIntegral $ popCount a))
+    (withBaseFiniteBits @mode @a (0 * a + fromIntegral (popCount a)))
     ( withBaseFiniteBits @mode @a $
         withBaseITEOp @mode @a (SymFiniteBits.symPopCount a)
     )
@@ -149,7 +149,7 @@ symCountLeadingZeros ::
   a
 symCountLeadingZeros a =
   withMode @mode
-    (withBaseFiniteBits @mode @a (fromIntegral $ countLeadingZeros a))
+    (withBaseFiniteBits @mode @a (0 * a + fromIntegral (countLeadingZeros a)))
     ( withBaseFiniteBits @mode @a $
         withBaseITEOp @mode @a (SymFiniteBits.symCountLeadingZeros a)
     )
@@ -163,7 +163,7 @@ symCountTrailingZeros ::
   a
 symCountTrailingZeros a =
   withMode @mode
-    (withBaseFiniteBits @mode @a (fromIntegral $ countTrailingZeros a))
+    (withBaseFiniteBits @mode @a (0 * a + fromIntegral (countTrailingZeros a)))
     ( withBaseFiniteBits @mode @a $
         withBaseITEOp @mode @a (SymFiniteBits.symCountTrailingZeros a)
     )

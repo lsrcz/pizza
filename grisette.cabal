@@ -124,9 +124,7 @@ library
     Grisette.Internal.SymPrim.IntBitwidth
     Grisette.Internal.SymPrim.ModelRep
     Grisette.Internal.SymPrim.Prim.Internal.Caches
-    Grisette.Internal.SymPrim.Prim.Internal.Instances.BVPEval
     Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalBitCastTerm
-    Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalBitwiseTerm
     Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalDivModIntegralTerm
     Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalFloatingTerm
     Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalFP
@@ -137,7 +135,6 @@ library
     Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalOrdTerm
     Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalRotateTerm
     Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalShiftTerm
-    Grisette.Internal.SymPrim.Prim.Internal.Instances.SupportedPrim
     Grisette.Internal.SymPrim.Prim.Internal.PartialEval
     Grisette.Internal.SymPrim.Prim.Internal.Serialize
     Grisette.Internal.SymPrim.Prim.Internal.Term

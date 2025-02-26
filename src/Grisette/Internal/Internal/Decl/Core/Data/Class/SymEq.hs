@@ -100,7 +100,7 @@ distinct (x : xs) = go x xs && distinct xs
 -- >>> a .== b
 -- (= a b)
 -- >>> a ./= b
--- (distinct a b)
+-- (! (= a b))
 --
 -- __Note:__ This type class can be derived for algebraic data types.
 -- You may need the @DerivingVia@ and @DerivingStrategies@ extensions.

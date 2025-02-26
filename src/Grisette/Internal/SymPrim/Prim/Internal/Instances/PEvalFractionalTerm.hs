@@ -18,7 +18,6 @@ module Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalFractionalTerm () 
 
 import Grisette.Internal.SymPrim.AlgReal (AlgReal)
 import Grisette.Internal.SymPrim.FP (FP, ValidFP)
-import Grisette.Internal.SymPrim.Prim.Internal.Instances.SupportedPrim ()
 import Grisette.Internal.SymPrim.Prim.Internal.Term
   ( PEvalFractionalTerm
       ( pevalFdivTerm,

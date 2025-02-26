@@ -87,25 +87,28 @@ data CachedInfo = CachedInfo
     cachedStableIdent :: {-# UNPACK #-} !StableIdent
   }
 
-newtype Cache t = Cache {getCache :: A.Array Int (CacheState t)}
+data Cache t = Cache
+  { getCache :: A.Array Int (CacheState t),
+    idSem :: MVar (),
+    nextId :: M.IOVector Id
+  }
 
 type HashTable k v = IORef (HM.HashMap k v)
 
 data CacheState t where
   CacheState ::
     { _sem :: MVar (),
-      _nextId :: M.IOVector Id,
       _currentThread :: HashTable (Description t) (Id, Weak StableIdent)
     } ->
     CacheState t
 
 finalizeCacheState :: CacheState t -> IO ()
-finalizeCacheState (CacheState _ _ s) = do
+finalizeCacheState (CacheState _ s) = do
   m <- readIORef s
   traverse_ (\(_, w) -> finalize w) m
 
 finalizeCache :: Cache t -> IO ()
-finalizeCache (Cache a) = mapM_ finalizeCacheState (A.elems a)
+finalizeCache (Cache a _ _) = mapM_ finalizeCacheState (A.elems a)
 
 -- | A class for interning terms.
 class Interned t where
@@ -137,11 +140,13 @@ mkCache = result
     element =
       CacheState
         <$> newMVar ()
-        <*> M.replicate 1 0
         <*> newIORef HM.empty
     result = do
       elements <- replicateM (fromIntegral cacheWidth) element
-      return $ Cache $ A.listArray (0, fromIntegral cacheWidth - 1) elements
+      idSem <- newMVar ()
+      nextId <- M.replicate 1 0
+      return $
+        Cache (A.listArray (0, fromIntegral cacheWidth - 1) elements) idSem nextId
 
 -- | Internal cache for memoization of term construction. Different types have
 -- different caches and they may share names, ids, or representations, but they
@@ -186,8 +191,8 @@ reclaimTerm id tyFingerprint grp dt = do
       cache <- readIORef cref
       case HM.lookup tyFingerprint cache of
         Just c -> do
-          let Cache a = unsafeCoerce c :: Cache t
-          let CacheState sem _ s = a A.! grp
+          let Cache a _ _ = unsafeCoerce c :: Cache t
+          let CacheState sem s = a A.! grp
           takeMVar sem
           current <- readIORef s
           case HM.lookup dt current of
@@ -215,14 +220,16 @@ intern !bt = do
   let !dt = describe bt :: Description t
       !hdt = descriptionDigest dt
       !r = hdt `mod` cacheWidth
-      CacheState sem nextId s = getCache cache A.! (fromIntegral r)
+      CacheState sem s = getCache cache A.! (fromIntegral r)
   takeMVar sem
   -- print ("intern", wtid, dt, r)
   current <- readIORef s
   case HM.lookup dt current of
     Nothing -> do
-      newId0 <- M.unsafeRead nextId 0
-      M.unsafeWrite nextId 0 (newId0 + 1)
+      takeMVar (idSem cache)
+      newId0 <- M.unsafeRead (nextId cache) 0
+      M.unsafeWrite (nextId cache) 0 (newId0 + 1)
+      putMVar (idSem cache) ()
       let newId = newId0 * cacheWidth + r
       newIdent <- makeStableName dt
       let anyNewIdent = unsafeCoerce newIdent :: StableIdent
@@ -237,8 +244,10 @@ intern !bt = do
       t1 <- deRefWeak oldIdentRef
       case t1 of
         Nothing -> do
-          newId0 <- M.unsafeRead nextId 0
-          M.unsafeWrite nextId 0 (newId0 + 1)
+          takeMVar (idSem cache)
+          newId0 <- M.unsafeRead (nextId cache) 0
+          M.unsafeWrite (nextId cache) 0 (newId0 + 1)
+          putMVar (idSem cache) ()
           let newId = newId0 * cacheWidth + r
           newIdent <- makeStableName dt
           let anyNewIdent = unsafeCoerce newIdent :: StableIdent
@@ -265,10 +274,10 @@ haveCache = do
   return $ HM.member tid caches
 
 cacheStateSize :: CacheState t -> IO Int
-cacheStateSize (CacheState _ _ s) = HM.size <$> readIORef s
+cacheStateSize (CacheState _ s) = HM.size <$> readIORef s
 
 cacheStateLiveSize :: CacheState t -> IO Int
-cacheStateLiveSize (CacheState sem _ s) = do
+cacheStateLiveSize (CacheState sem s) = do
   takeMVar sem
   v <- fmap snd . HM.toList <$> readIORef s
   r <-
@@ -282,30 +291,11 @@ cacheStateLiveSize (CacheState sem _ s) = do
   putMVar sem ()
   return r
 
-{-
-dumpCacheState :: CacheState t -> IO ()
-dumpCacheState (CacheState sem s) = do
-  takeMVar sem
-  v <- HM.toList <$> readIORef s
-  mapM_
-    ( \(k, (i, v)) -> do
-        v1 <- deRefWeak v
-        case v1 of
-          Nothing -> print (k, i, "dead")
-          Just r -> print (k, i, r)
-    )
-    v
-  putMVar sem ()
-
-dumpCache :: Cache t -> IO ()
-dumpCache (Cache a) = mapM_ dumpCacheState (A.elems a)
--}
-
 cacheSize :: Cache t -> IO Int
-cacheSize (Cache a) = sum <$> mapM cacheStateSize (A.elems a)
+cacheSize (Cache a _ _) = sum <$> mapM cacheStateSize (A.elems a)
 
 cacheLiveSize :: Cache t -> IO Int
-cacheLiveSize (Cache a) = sum <$> mapM cacheStateLiveSize (A.elems a)
+cacheLiveSize (Cache a _ _) = sum <$> mapM cacheStateLiveSize (A.elems a)
 
 -- | Get the size of the current thread's cache.
 threadCacheSize :: WeakThreadId -> IO Int
@@ -326,15 +316,3 @@ threadCacheLiveSize tid = do
       cache <- readIORef cref
       sum <$> mapM cacheLiveSize (HM.elems cache)
     Nothing -> return 0
-
-{-
--- | Dump the current thread's cache.
-dumpThreadCache :: WeakThreadId -> IO ()
-dumpThreadCache tid = do
-  caches <- readIORef termCacheCell
-  case HM.lookup tid caches of
-    Just (_, cref) -> do
-      cache <- readIORef cref
-      mapM_ dumpCache (HM.elems cache)
-    Nothing -> return ()
--}

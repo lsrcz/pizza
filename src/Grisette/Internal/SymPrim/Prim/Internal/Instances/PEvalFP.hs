@@ -31,7 +31,6 @@ import Grisette.Internal.Core.Data.Class.IEEEFP
       ),
   )
 import Grisette.Internal.SymPrim.FP (FP, ValidFP)
-import Grisette.Internal.SymPrim.Prim.Internal.Instances.SupportedPrim ()
 import Grisette.Internal.SymPrim.Prim.Internal.Term
   ( FPBinaryOp (FPMaximum, FPMaximumNumber, FPMinimum, FPMinimumNumber, FPRem),
     FPRoundingBinaryOp (FPAdd, FPDiv, FPMul, FPSub),

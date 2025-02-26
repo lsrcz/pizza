@@ -17,7 +17,6 @@ module Grisette.Internal.SymPrim.Prim.Pattern
 where
 
 import Data.Foldable (Foldable (toList))
-import Grisette.Internal.SymPrim.Prim.Internal.Instances.SupportedPrim ()
 import Grisette.Internal.SymPrim.Prim.Internal.Term
   ( Term,
     pattern AbsNumTerm,
@@ -129,4 +128,5 @@ pattern SubTerms ts <- (subTermsViewPattern -> Just ts)
 
 #if MIN_VERSION_base(4, 16, 4)
 {-# COMPLETE SubTerms #-}
+{-# INLINE SubTerms #-}
 #endif

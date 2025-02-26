@@ -57,9 +57,7 @@ import Grisette.Internal.SymPrim.FP
   )
 import Grisette.Internal.SymPrim.GeneralFun (type (-->) (GeneralFun))
 import Grisette.Internal.SymPrim.Prim.Internal.Caches (Id)
-import Grisette.Internal.SymPrim.Prim.Internal.Instances.BVPEval ()
 import Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalBitCastTerm ()
-import Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalBitwiseTerm ()
 import Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalDivModIntegralTerm ()
 import Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalFloatingTerm ()
 import Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalFractionalTerm ()
@@ -69,7 +67,6 @@ import Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalNumTerm ()
 import Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalOrdTerm ()
 import Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalRotateTerm ()
 import Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalShiftTerm ()
-import Grisette.Internal.SymPrim.Prim.Internal.Instances.SupportedPrim ()
 import Grisette.Internal.SymPrim.Prim.Internal.Term
   ( FPBinaryOp,
     FPRoundingBinaryOp,

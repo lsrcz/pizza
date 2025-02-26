@@ -67,6 +67,7 @@ import Grisette.Internal.SymPrim.Prim.Internal.Term
     pevalEqTerm,
     pevalITEBasicTerm,
     pattern ConTerm,
+    pattern ITETerm,
   )
 import Language.Haskell.TH.Syntax (Lift)
 
@@ -139,6 +140,8 @@ instance
           go [] = conTerm d
           go ((x, y) : xs) =
             pevalITETerm (pevalEqTerm a (conTerm x)) (conTerm y) (go xs)
+      doPevalApplyTerm (ITETerm cond t f) v =
+        Just $ pevalITETerm cond (pevalApplyTerm t v) (pevalApplyTerm f v)
       doPevalApplyTerm _ _ = Nothing
   sbvApplyTerm f a =
     withPrim @(a =-> b) $ withNonFuncPrim @a $ f a

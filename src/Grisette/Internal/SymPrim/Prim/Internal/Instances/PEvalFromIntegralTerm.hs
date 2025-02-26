@@ -25,14 +25,12 @@ import GHC.TypeLits (KnownNat, type (<=))
 import Grisette.Internal.SymPrim.AlgReal (AlgReal)
 import Grisette.Internal.SymPrim.BV (IntN, WordN)
 import Grisette.Internal.SymPrim.FP (FP, ValidFP)
-import Grisette.Internal.SymPrim.Prim.Internal.Instances.SupportedPrim
-  ( bvIsNonZeroFromGEq1,
-  )
 import Grisette.Internal.SymPrim.Prim.Internal.Term
   ( PEvalFromIntegralTerm (pevalFromIntegralTerm, sbvFromIntegralTerm),
     SupportedNonFuncPrim (withNonFuncPrim),
     SupportedPrim,
     Term,
+    bvIsNonZeroFromGEq1,
     conTerm,
     fromIntegralTerm,
     pattern ConTerm,

@@ -51,9 +51,6 @@ import Grisette.Internal.SymPrim.FP
     FPRoundingMode (RNA, RNE, RTN, RTP, RTZ),
     ValidFP,
   )
-import Grisette.Internal.SymPrim.Prim.Internal.Instances.SupportedPrim
-  ( bvIsNonZeroFromGEq1,
-  )
 import Grisette.Internal.SymPrim.Prim.Internal.Term
   ( PEvalIEEEFPConvertibleTerm
       ( pevalFromFPOrTerm,
@@ -64,6 +61,7 @@ import Grisette.Internal.SymPrim.Prim.Internal.Term
     SBVRep (SBVType),
     SupportedPrim (conSBVTerm),
     Term,
+    bvIsNonZeroFromGEq1,
     conTerm,
     fromFPOrTerm,
     toFPTerm,

@@ -801,8 +801,13 @@ instance (SizedBV bv) => BV (SomeBV bv) where
   bvSelect ix w (SomeBV (a :: bv n))
     | ix + w > n =
         error $
-          "bvSelect: trying to select a bitvector outside the bounds of the "
-            <> "inserialize"
+          "bvSelect: trying to select a bitvector outside the bounds, "
+            <> "ix = "
+            <> show ix
+            <> ", w = "
+            <> show w
+            <> ", n = "
+            <> show n
     | w == 0 = error "bvSelect: trying to select a bitvector of size 0"
     | otherwise = res (Proxy @n) (Proxy @n)
     where

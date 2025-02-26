@@ -16,7 +16,6 @@ module Grisette.Internal.SymPrim.Prim.Internal.Instances.PEvalFloatingTerm () wh
 
 import Grisette.Internal.SymPrim.AlgReal (AlgReal)
 import Grisette.Internal.SymPrim.FP (FP, ValidFP)
-import Grisette.Internal.SymPrim.Prim.Internal.Instances.SupportedPrim ()
 import Grisette.Internal.SymPrim.Prim.Internal.Term
   ( FloatingUnaryOp (FloatingAcosh, FloatingAsinh, FloatingAtanh, FloatingSqrt),
     PEvalFloatingTerm
